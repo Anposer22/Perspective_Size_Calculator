@@ -2,19 +2,26 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  calibrate,
+  calibrateFromLengths,
   measureLength,
+  MIN_CALIBRATION_LINES,
   type CalibrationResult,
-  type LengthConstraint,
+  type CalibLine,
   type Point,
 } from "@/lib/homography";
 
-type Mode = "calibrate" | "addref" | "measure";
+type Mode = "idle" | "addcalib" | "measure";
 
+type Line = { id: number; a: Point; b: Point; length: number };
 type Measurement = { id: number; a: Point; b: Point };
-type RefSegment = { id: number; a: Point; b: Point; length: number };
 
-const CORNER_LABELS = ["sup. izq.", "sup. der.", "inf. der.", "inf. izq."];
+// A handle that can be dragged. Refers back to the data it belongs to.
+type DragRef =
+  | { type: "calib"; id: number; end: "a" | "b" }
+  | { type: "measure"; id: number; end: "a" | "b" }
+  | { type: "pending"; index: number };
+
+const HANDLE_HIT_RADIUS = 10; // screen px
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -22,55 +29,34 @@ export default function Home() {
   const imgRef = useRef<HTMLImageElement | null>(null);
 
   const [hasImage, setHasImage] = useState(false);
-  const [mode, setMode] = useState<Mode>("calibrate");
+  const [mode, setMode] = useState<Mode>("idle");
 
-  // View transform (CSS pixels): screen = image * scale + offset.
   const viewRef = useRef({ scale: 1, offsetX: 0, offsetY: 0 });
 
-  // Calibration inputs.
-  const [corners, setCorners] = useState<Point[]>([]);
-  const [rectW, setRectW] = useState<string>("");
-  const [rectH, setRectH] = useState<string>("");
-
-  // Extra reference segments (optional, improve precision).
-  const [refs, setRefs] = useState<RefSegment[]>([]);
-
-  // Measurements.
+  const [calibLines, setCalibLines] = useState<Line[]>([]);
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
-
-  // In-progress point collection (image coords).
   const [pending, setPending] = useState<Point[]>([]);
-  const [pendingRefLen, setPendingRefLen] = useState<string>("");
+  const [pendingLen, setPendingLen] = useState<string>("");
 
   const [calib, setCalib] = useState<CalibrationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Live cursor (image coords) + whether over canvas, for guide line + loupe.
   const cursorRef = useRef<{ img: Point; screen: Point } | null>(null);
   const idRef = useRef(1);
 
-  // ---- Image loading -------------------------------------------------------
+  // Live mutable copies for use inside pointer handlers (avoid stale closures).
+  const stateRef = useRef({
+    mode,
+    calibLines,
+    measurements,
+    pending,
+    hasImage,
+  });
+  useEffect(() => {
+    stateRef.current = { mode, calibLines, measurements, pending, hasImage };
+  }, [mode, calibLines, measurements, pending, hasImage]);
 
-  const loadImageFromBlob = useCallback((blob: Blob) => {
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => {
-      imgRef.current = img;
-      setHasImage(true);
-      setError(null);
-      // Reset everything tied to the previous image.
-      setCorners([]);
-      setRefs([]);
-      setMeasurements([]);
-      setPending([]);
-      setCalib(null);
-      setMode("calibrate");
-      fitImage();
-      URL.revokeObjectURL(url);
-    };
-    img.onerror = () => setError("No se pudo cargar la imagen.");
-    img.src = url;
-  }, []);
+  // ---- Image loading -------------------------------------------------------
 
   const fitImage = useCallback(() => {
     const wrap = wrapRef.current;
@@ -86,7 +72,29 @@ export default function Home() {
     };
   }, []);
 
-  // Paste from clipboard.
+  const loadImageFromBlob = useCallback(
+    (blob: Blob) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        imgRef.current = img;
+        setHasImage(true);
+        setError(null);
+        setCalibLines([]);
+        setMeasurements([]);
+        setPending([]);
+        setPendingLen("");
+        setCalib(null);
+        setMode("addcalib");
+        fitImage();
+        URL.revokeObjectURL(url);
+      };
+      img.onerror = () => setError("No se pudo cargar la imagen.");
+      img.src = url;
+    },
+    [fitImage]
+  );
+
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
       const items = e.clipboardData?.items;
@@ -126,35 +134,77 @@ export default function Home() {
   // ---- Calibration recompute ----------------------------------------------
 
   useEffect(() => {
-    const w = parseFloat(rectW);
-    const h = parseFloat(rectH);
-    if (corners.length !== 4 || !(w > 0) || !(h > 0)) {
+    if (calibLines.length < MIN_CALIBRATION_LINES) {
       setCalib(null);
       return;
     }
-    const constraints: LengthConstraint[] = refs.map((r) => ({
-      a: r.a,
-      b: r.b,
-      length: r.length,
+    const lines: CalibLine[] = calibLines.map((l) => ({
+      a: l.a,
+      b: l.b,
+      length: l.length,
     }));
-    const result = calibrate(corners, w, h, constraints);
+    const result = calibrateFromLengths(lines);
     if (!result) {
-      setError("La calibración falló: revisa que las esquinas no estén alineadas.");
       setCalib(null);
+      setError(
+        "La calibración no converge: prueba a usar líneas en orientaciones y posiciones más variadas."
+      );
     } else {
       setError(null);
       setCalib(result);
     }
-  }, [corners, rectW, rectH, refs]);
+  }, [calibLines]);
+
+  // ---- Hit testing for draggable handles -----------------------------------
+
+  const hitTestHandle = (screen: Point): DragRef | null => {
+    const { calibLines, measurements, pending } = stateRef.current;
+    const r2 = HANDLE_HIT_RADIUS * HANDLE_HIT_RADIUS;
+    const near = (p: Point) => {
+      const s = imageToScreen(p);
+      const dx = s.x - screen.x;
+      const dy = s.y - screen.y;
+      return dx * dx + dy * dy <= r2;
+    };
+    // Pending points first (most recently placed, on top).
+    for (let i = pending.length - 1; i >= 0; i--) {
+      if (near(pending[i])) return { type: "pending", index: i };
+    }
+    for (let i = measurements.length - 1; i >= 0; i--) {
+      if (near(measurements[i].b)) return { type: "measure", id: measurements[i].id, end: "b" };
+      if (near(measurements[i].a)) return { type: "measure", id: measurements[i].id, end: "a" };
+    }
+    for (let i = calibLines.length - 1; i >= 0; i--) {
+      if (near(calibLines[i].b)) return { type: "calib", id: calibLines[i].id, end: "b" };
+      if (near(calibLines[i].a)) return { type: "calib", id: calibLines[i].id, end: "a" };
+    }
+    return null;
+  };
+
+  const moveHandle = (ref: DragRef, img: Point) => {
+    if (ref.type === "pending") {
+      setPending((prev) => prev.map((p, i) => (i === ref.index ? img : p)));
+    } else if (ref.type === "calib") {
+      setCalibLines((prev) =>
+        prev.map((l) => (l.id === ref.id ? { ...l, [ref.end]: img } : l))
+      );
+    } else {
+      setMeasurements((prev) =>
+        prev.map((m) => (m.id === ref.id ? { ...m, [ref.end]: img } : m))
+      );
+    }
+  };
 
   // ---- Pointer interaction -------------------------------------------------
 
-  const panState = useRef<{
-    active: boolean;
-    startX: number;
-    startY: number;
-    ox: number;
-    oy: number;
+  // Gesture state lives in refs so handlers stay stable.
+  const dragRef = useRef<DragRef | null>(null);
+  const gestureRef = useRef<{
+    decided: "none" | "pan" | "drag";
+    startScreen: Point;
+    startImg: Point;
+    startOffset: { x: number; y: number };
+    forcePan: boolean;
   } | null>(null);
   const spaceDown = useRef(false);
 
@@ -179,45 +229,79 @@ export default function Home() {
   };
 
   const onPointerDown = (e: React.PointerEvent) => {
-    if (!hasImage) return;
+    if (!stateRef.current.hasImage) return;
     const local = getLocal(e);
-    const isPan = e.button === 1 || (e.button === 0 && spaceDown.current);
-    if (isPan) {
-      const v = viewRef.current;
-      panState.current = {
-        active: true,
-        startX: local.x,
-        startY: local.y,
-        ox: v.offsetX,
-        oy: v.offsetY,
-      };
-      (e.target as Element).setPointerCapture(e.pointerId);
-      return;
+    (e.target as Element).setPointerCapture(e.pointerId);
+
+    // Middle button or space => always pan.
+    const forcePan = e.button === 1 || spaceDown.current;
+
+    if (e.button === 0 && !forcePan) {
+      const hit = hitTestHandle(local);
+      if (hit) {
+        dragRef.current = hit;
+        return;
+      }
     }
-    if (e.button !== 0) return;
-    placePoint(screenToImage(local.x, local.y));
+    if (e.button !== 0 && e.button !== 1) return;
+
+    const v = viewRef.current;
+    gestureRef.current = {
+      decided: "none",
+      startScreen: local,
+      startImg: screenToImage(local.x, local.y),
+      startOffset: { x: v.offsetX, y: v.offsetY },
+      forcePan,
+    };
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
-    if (!hasImage) return;
+    if (!stateRef.current.hasImage) return;
     const local = getLocal(e);
-    if (panState.current?.active) {
-      const p = panState.current;
-      viewRef.current.offsetX = p.ox + (local.x - p.startX);
-      viewRef.current.offsetY = p.oy + (local.y - p.startY);
+
+    if (dragRef.current) {
+      moveHandle(dragRef.current, screenToImage(local.x, local.y));
+      cursorRef.current = { img: screenToImage(local.x, local.y), screen: local };
       draw();
       return;
     }
+
+    const g = gestureRef.current;
+    if (g) {
+      const dx = local.x - g.startScreen.x;
+      const dy = local.y - g.startScreen.y;
+      if (g.decided === "none") {
+        if (g.forcePan) g.decided = "pan";
+        else if (dx * dx + dy * dy > 16) g.decided = "pan";
+      }
+      if (g.decided === "pan") {
+        viewRef.current.offsetX = g.startOffset.x + dx;
+        viewRef.current.offsetY = g.startOffset.y + dy;
+        cursorRef.current = null;
+        draw();
+        return;
+      }
+    }
+
     cursorRef.current = { img: screenToImage(local.x, local.y), screen: local };
     draw();
   };
 
   const onPointerUp = (e: React.PointerEvent) => {
-    if (panState.current?.active) {
-      panState.current.active = false;
-      try {
-        (e.target as Element).releasePointerCapture(e.pointerId);
-      } catch {}
+    try {
+      (e.target as Element).releasePointerCapture(e.pointerId);
+    } catch {}
+
+    if (dragRef.current) {
+      dragRef.current = null;
+      return;
+    }
+    const g = gestureRef.current;
+    gestureRef.current = null;
+    if (!g) return;
+    // A click (never became a pan) places a point in the active mode.
+    if (g.decided === "none" && !g.forcePan) {
+      placePoint(g.startImg);
     }
   };
 
@@ -231,8 +315,7 @@ export default function Home() {
     const local = getLocal(e as unknown as React.PointerEvent);
     const v = viewRef.current;
     const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-    const newScale = Math.max(0.05, Math.min(40, v.scale * factor));
-    // Zoom toward cursor: keep the image point under the cursor fixed.
+    const newScale = Math.max(0.05, Math.min(60, v.scale * factor));
     const imgX = (local.x - v.offsetX) / v.scale;
     const imgY = (local.y - v.offsetY) / v.scale;
     v.scale = newScale;
@@ -242,37 +325,40 @@ export default function Home() {
   };
 
   const placePoint = (p: Point) => {
-    if (mode === "calibrate") {
-      if (corners.length >= 4) return;
-      setCorners((c) => [...c, p]);
-      return;
-    }
-    // addref / measure collect 2 points.
+    const m = stateRef.current.mode;
+    if (m !== "addcalib" && m !== "measure") return;
+    // In calibration, the 2 points wait for a length before accepting more.
+    if (m === "addcalib" && stateRef.current.pending.length >= 2) return;
     setPending((prev) => {
       const next = [...prev, p];
       if (next.length === 2) {
-        if (mode === "measure") {
-          setMeasurements((m) => [
-            ...m,
+        if (m === "measure") {
+          setMeasurements((arr) => [
+            ...arr,
             { id: idRef.current++, a: next[0], b: next[1] },
           ]);
           return [];
         }
-        // addref: keep the 2 points pending until length is confirmed.
+        // addcalib: hold until length confirmed.
       }
       return next;
     });
   };
 
-  const confirmRef = () => {
-    const len = parseFloat(pendingRefLen);
+  const confirmCalibLine = () => {
+    const len = parseFloat(pendingLen);
     if (pending.length !== 2 || !(len > 0)) return;
-    setRefs((r) => [
-      ...r,
+    setCalibLines((prev) => [
+      ...prev,
       { id: idRef.current++, a: pending[0], b: pending[1], length: len },
     ]);
     setPending([]);
-    setPendingRefLen("");
+    setPendingLen("");
+  };
+
+  const cancelPending = () => {
+    setPending([]);
+    setPendingLen("");
   };
 
   // ---- Rendering -----------------------------------------------------------
@@ -306,31 +392,17 @@ export default function Home() {
       img.height * v.scale
     );
 
-    // Reference rectangle (calibration corners).
-    if (corners.length > 0) {
-      const sc = corners.map(imageToScreen);
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = "#4da3ff";
-      ctx.fillStyle = "rgba(77,163,255,0.12)";
-      ctx.beginPath();
-      sc.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-      if (corners.length === 4) ctx.closePath();
-      if (corners.length === 4) ctx.fill();
-      ctx.stroke();
-      sc.forEach((p, i) => drawHandle(ctx, p, "#4da3ff", String(i + 1)));
-    }
-
-    // Reference segments (extra).
-    refs.forEach((r) => {
-      const a = imageToScreen(r.a);
-      const b = imageToScreen(r.b);
+    // Calibration lines (green) with their known length.
+    calibLines.forEach((l) => {
+      const a = imageToScreen(l.a);
+      const b = imageToScreen(l.b);
       drawSegment(ctx, a, b, "#46c66a");
       drawHandle(ctx, a, "#46c66a");
       drawHandle(ctx, b, "#46c66a");
-      drawLabel(ctx, midpoint(a, b), `${r.length} mm`, "#46c66a");
+      drawLabel(ctx, midpoint(a, b), `${l.length} mm`, "#46c66a");
     });
 
-    // Measurements.
+    // Measurements (orange) with computed length.
     measurements.forEach((m) => {
       const a = imageToScreen(m.a);
       const b = imageToScreen(m.b);
@@ -343,54 +415,60 @@ export default function Home() {
       }
     });
 
-    // Pending points + guide line that extends across the canvas.
+    // Pending point(s) + full-screen guide line.
     const cur = cursorRef.current;
-    if (pending.length > 0) {
+    if (pending.length === 1) {
       const a = imageToScreen(pending[0]);
       drawHandle(ctx, a, "#ffffff");
       if (cur) {
-        const b = cur.screen;
-        drawExtendedLine(ctx, a, b, cw, ch);
-        drawSegment(ctx, a, b, "#ffffff");
+        drawExtendedLine(ctx, a, cur.screen, cw, ch);
+        drawSegment(ctx, a, cur.screen, "#ffffff");
       }
+    } else if (pending.length === 2) {
+      const a = imageToScreen(pending[0]);
+      const b = imageToScreen(pending[1]);
+      drawExtendedLine(ctx, a, b, cw, ch);
+      drawSegment(ctx, a, b, "#ffffff");
+      drawHandle(ctx, a, "#ffffff");
+      drawHandle(ctx, b, "#ffffff");
     }
 
-    // Crosshair + loupe in placement modes.
-    if (cur && !panState.current?.active) {
+    // Crosshair + loupe while placing points.
+    const placing = mode === "addcalib" || mode === "measure";
+    if (cur && placing && !dragRef.current) {
       drawCrosshair(ctx, cur.screen, cw, ch);
       drawLoupe(ctx, img, v, cur, cw, ch);
     }
-  }, [corners, refs, measurements, pending, calib]);
+  }, [calibLines, measurements, pending, calib, mode]);
 
   useEffect(() => {
     draw();
   }, [draw, hasImage]);
 
-  // Redraw on resize.
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap) return;
-    const ro = new ResizeObserver(() => {
-      if (imgRef.current && corners.length === 0 && refs.length === 0) {
-        // Only re-fit before the user starts marking, to avoid moving points.
-      }
-      draw();
-    });
+    const ro = new ResizeObserver(() => draw());
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [draw, corners.length, refs.length]);
+  }, [draw]);
 
-  // ---- Derived UI state ----------------------------------------------------
+  // ---- Derived UI ----------------------------------------------------------
 
   const calibrated = !!calib;
-  const cornersDone = corners.length === 4;
-  const dimsDone = parseFloat(rectW) > 0 && parseFloat(rectH) > 0;
+  const linesLeft = Math.max(0, MIN_CALIBRATION_LINES - calibLines.length);
 
   const resetCalibration = () => {
-    setCorners([]);
-    setRefs([]);
+    setCalibLines([]);
     setPending([]);
+    setPendingLen("");
     setCalib(null);
+  };
+
+  const toggleMode = (m: Mode) => {
+    setPending([]);
+    setPendingLen("");
+    setMode((cur) => (cur === m ? "idle" : m));
   };
 
   // -------------------------------------------------------------------------
@@ -442,131 +520,95 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Step 2: calibration */}
+        {/* Step 2: calibration via free known-length lines */}
         <div className="card">
           <div
             className={`step ${
-              calibrated ? "done" : cornersDone || dimsDone ? "active" : ""
+              calibrated ? "done" : calibLines.length > 0 ? "active" : ""
             }`}
           >
             <div className="num">2</div>
             <div className="body">
-              <div className="title">Calibra con el objeto conocido</div>
+              <div className="title">Calibra con medidas conocidas</div>
               <div className="desc">
-                Marca las <b>4 esquinas</b> del objeto rectangular (en orden) e
-                introduce su tamaño real.
+                Traza líneas sobre objetos de tamaño conocido e indica su
+                longitud real. No hace falta que formen un rectángulo. Mínimo{" "}
+                <b>{MIN_CALIBRATION_LINES}</b> líneas; añade más (en distintas
+                orientaciones y zonas) para más precisión.
               </div>
 
               <div className="row" style={{ marginTop: 10 }}>
                 <button
-                  className={`btn ${mode === "calibrate" ? "active" : ""}`}
-                  onClick={() => setMode("calibrate")}
+                  className={`btn ${mode === "addcalib" ? "active" : ""}`}
+                  onClick={() => toggleMode("addcalib")}
                   disabled={!hasImage}
                 >
-                  Marcar esquinas ({corners.length}/4)
+                  {mode === "addcalib" ? "Trazando…" : "Añadir línea"}
                 </button>
                 <button
                   className="btn ghost"
                   onClick={resetCalibration}
-                  disabled={corners.length === 0 && refs.length === 0}
+                  disabled={calibLines.length === 0}
                 >
                   Reiniciar
                 </button>
               </div>
 
-              {mode === "calibrate" && hasImage && (
-                <div className="hint" style={{ marginTop: 8 }}>
-                  {corners.length < 4
-                    ? `Haz clic en la esquina ${CORNER_LABELS[corners.length]}.`
-                    : "4 esquinas marcadas. Introduce las dimensiones reales."}
+              <div className="progress-text">
+                {calibrated
+                  ? `Calibrado con ${calibLines.length} líneas.`
+                  : `${calibLines.length}/${MIN_CALIBRATION_LINES} líneas — faltan ${linesLeft}.`}
+              </div>
+
+              {mode === "addcalib" && (
+                <div className="hint" style={{ marginTop: 6 }}>
+                  {pending.length === 0 &&
+                    "Haz clic en el primer punto de una medida conocida."}
+                  {pending.length === 1 && "Haz clic en el segundo punto."}
+                  {pending.length === 2 && "Indica su longitud real:"}
                 </div>
               )}
 
-              <div className="row" style={{ marginTop: 10 }}>
-                <label className="field">
-                  Ancho (mm)
-                  <input
-                    type="number"
-                    value={rectW}
-                    onChange={(e) => setRectW(e.target.value)}
-                    placeholder="ej. 24.5"
-                  />
-                </label>
-                <label className="field">
-                  Alto (mm)
-                  <input
-                    type="number"
-                    value={rectH}
-                    onChange={(e) => setRectH(e.target.value)}
-                    placeholder="ej. 18.0"
-                  />
-                </label>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Step 3: optional extra references */}
-        <div className="card">
-          <div className={`step ${refs.length > 0 ? "done" : ""}`}>
-            <div className="num">+</div>
-            <div className="body">
-              <div className="title">Referencias extra (opcional)</div>
-              <div className="desc">
-                Añade más segmentos de longitud conocida para afinar la
-                precisión. Reduce el error promediando el ruido.
-              </div>
-              <div className="row" style={{ marginTop: 10 }}>
-                <button
-                  className={`btn ${mode === "addref" ? "active" : ""}`}
-                  onClick={() => {
-                    setMode("addref");
-                    setPending([]);
-                  }}
-                  disabled={!cornersDone}
-                >
-                  Añadir referencia
-                </button>
-              </div>
-              {mode === "addref" && (
-                <div className="hint" style={{ marginTop: 8 }}>
-                  {pending.length === 0 && "Marca el primer punto del segmento."}
-                  {pending.length === 1 && "Marca el segundo punto."}
-                  {pending.length === 2 && "Introduce su longitud real:"}
-                </div>
-              )}
-              {mode === "addref" && pending.length === 2 && (
+              {mode === "addcalib" && pending.length === 2 && (
                 <div className="row" style={{ marginTop: 8 }}>
                   <label className="field">
                     Longitud (mm)
                     <input
                       type="number"
                       autoFocus
-                      value={pendingRefLen}
-                      onChange={(e) => setPendingRefLen(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && confirmRef()}
+                      value={pendingLen}
+                      onChange={(e) => setPendingLen(e.target.value)}
+                      onKeyDown={(e) =>
+                        e.key === "Enter" && confirmCalibLine()
+                      }
                     />
                   </label>
                   <button
-                    className="btn primary"
-                    style={{ alignSelf: "flex-end" }}
-                    onClick={confirmRef}
+                    className="btn primary stretch-end"
+                    onClick={confirmCalibLine}
                   >
                     Añadir
                   </button>
+                  <button
+                    className="btn ghost stretch-end"
+                    onClick={cancelPending}
+                  >
+                    ✕
+                  </button>
                 </div>
               )}
-              {refs.length > 0 && (
+
+              {calibLines.length > 0 && (
                 <div className="measure-list" style={{ marginTop: 10 }}>
-                  {refs.map((r) => (
-                    <div className="measure-item" key={r.id}>
-                      <span>Referencia</span>
+                  {calibLines.map((l, i) => (
+                    <div className="measure-item" key={l.id}>
+                      <span>Línea {i + 1}</span>
                       <span className="val" style={{ color: "#46c66a" }}>
-                        {r.length} mm
+                        {l.length} mm
                       </span>
                       <button
                         onClick={() =>
-                          setRefs((x) => x.filter((y) => y.id !== r.id))
+                          setCalibLines((x) => x.filter((y) => y.id !== l.id))
                         }
                         title="Eliminar"
                       >
@@ -576,38 +618,6 @@ export default function Home() {
                   ))}
                 </div>
               )}
-            </div>
-          </div>
-        </div>
-
-        {/* Step 4: measure */}
-        <div className="card">
-          <div className={`step ${calibrated ? "active" : ""}`}>
-            <div className="num">3</div>
-            <div className="body">
-              <div className="title">Mide objetos</div>
-              <div className="desc">
-                Con la imagen calibrada, traza segmentos entre dos puntos.
-              </div>
-              <div className="row" style={{ marginTop: 10 }}>
-                <button
-                  className={`btn primary ${mode === "measure" ? "active" : ""}`}
-                  onClick={() => {
-                    setMode("measure");
-                    setPending([]);
-                  }}
-                  disabled={!calibrated}
-                >
-                  Medir
-                </button>
-                <button
-                  className="btn ghost"
-                  onClick={() => setMeasurements([])}
-                  disabled={measurements.length === 0}
-                >
-                  Limpiar
-                </button>
-              </div>
 
               {calib && (
                 <div style={{ marginTop: 10, display: "grid", gap: 4 }}>
@@ -620,6 +630,35 @@ export default function Home() {
                   </div>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+
+        {/* Step 3: measure */}
+        <div className="card">
+          <div className={`step ${calibrated ? "active" : ""}`}>
+            <div className="num">3</div>
+            <div className="body">
+              <div className="title">Mide objetos</div>
+              <div className="desc">
+                Con la imagen calibrada, traza segmentos entre dos puntos.
+              </div>
+              <div className="row" style={{ marginTop: 10 }}>
+                <button
+                  className={`btn primary ${mode === "measure" ? "active" : ""}`}
+                  onClick={() => toggleMode("measure")}
+                  disabled={!calibrated}
+                >
+                  {mode === "measure" ? "Midiendo…" : "Medir"}
+                </button>
+                <button
+                  className="btn ghost"
+                  onClick={() => setMeasurements([])}
+                  disabled={measurements.length === 0}
+                >
+                  Limpiar
+                </button>
+              </div>
 
               {measurements.length > 0 && (
                 <div className="measure-list" style={{ marginTop: 10 }}>
@@ -634,9 +673,7 @@ export default function Home() {
                       </span>
                       <button
                         onClick={() =>
-                          setMeasurements((x) =>
-                            x.filter((y) => y.id !== m.id)
-                          )
+                          setMeasurements((x) => x.filter((y) => y.id !== m.id))
                         }
                         title="Eliminar"
                       >
@@ -651,9 +688,9 @@ export default function Home() {
         </div>
 
         <div className="hint">
-          <b>Atajos:</b> rueda = zoom · arrastrar con <kbd>Espacio</kbd> o botón
-          central = mover. Asegúrate de que los objetos a medir están en el
-          mismo plano que la referencia.
+          <b>Controles:</b> clic = colocar punto · arrastrar un punto = moverlo ·
+          arrastrar la imagen = desplazar · rueda = zoom. Mide solo objetos en el
+          mismo plano que las referencias.
         </div>
       </aside>
 
@@ -666,7 +703,13 @@ export default function Home() {
           onPointerLeave={onPointerLeave}
           onWheel={onWheel}
           onContextMenu={(e) => e.preventDefault()}
-          style={{ cursor: hasImage ? "crosshair" : "default" }}
+          style={{
+            cursor: !hasImage
+              ? "default"
+              : mode === "idle"
+              ? "grab"
+              : "crosshair",
+          }}
         />
         {!hasImage && (
           <div className="empty-state">
@@ -742,7 +785,6 @@ function drawLabel(
   ctx.textBaseline = "alphabetic";
 }
 
-// Draw the line through a->b extended to the canvas edges.
 function drawExtendedLine(
   ctx: CanvasRenderingContext2D,
   a: Point,
@@ -757,15 +799,13 @@ function drawExtendedLine(
   const ux = dx / len;
   const uy = dy / len;
   const far = cw + ch;
-  const p1 = { x: a.x - ux * far, y: a.y - uy * far };
-  const p2 = { x: a.x + ux * far, y: a.y + uy * far };
   ctx.save();
   ctx.setLineDash([6, 6]);
   ctx.lineWidth = 1;
   ctx.strokeStyle = "rgba(255,255,255,0.5)";
   ctx.beginPath();
-  ctx.moveTo(p1.x, p1.y);
-  ctx.lineTo(p2.x, p2.y);
+  ctx.moveTo(a.x - ux * far, a.y - uy * far);
+  ctx.lineTo(a.x + ux * far, a.y + uy * far);
   ctx.stroke();
   ctx.restore();
 }
@@ -789,7 +829,6 @@ function drawCrosshair(
   ctx.restore();
 }
 
-// Magnifier loupe for sub-pixel point placement.
 function drawLoupe(
   ctx: CanvasRenderingContext2D,
   img: HTMLImageElement,
@@ -798,10 +837,9 @@ function drawLoupe(
   cw: number,
   ch: number
 ) {
-  const R = 70; // loupe radius
-  const zoom = 6; // magnification relative to image native px
+  const R = 70;
+  const zoom = 6;
   const margin = 16;
-  // Place loupe in the corner away from the cursor.
   const lx = cur.screen.x < cw / 2 ? cw - R - margin : R + margin;
   const ly = cur.screen.y < ch / 2 ? ch - R - margin : R + margin;
   const center = { x: lx, y: ly };
@@ -811,10 +849,8 @@ function drawLoupe(
   ctx.arc(center.x, center.y, R, 0, Math.PI * 2);
   ctx.closePath();
   ctx.clip();
-  // Background.
   ctx.fillStyle = "#000";
   ctx.fillRect(center.x - R, center.y - R, R * 2, R * 2);
-  // Draw the image magnified around the cursor's image coordinate.
   const srcW = (R * 2) / zoom;
   const srcX = cur.img.x - srcW / 2;
   const srcY = cur.img.y - srcW / 2;
@@ -831,7 +867,6 @@ function drawLoupe(
     R * 2
   );
   ctx.imageSmoothingEnabled = true;
-  // Crosshair at center.
   ctx.strokeStyle = "rgba(255,138,61,0.9)";
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -841,7 +876,6 @@ function drawLoupe(
   ctx.lineTo(center.x, center.y + 12);
   ctx.stroke();
   ctx.restore();
-  // Border ring.
   ctx.beginPath();
   ctx.arc(center.x, center.y, R, 0, Math.PI * 2);
   ctx.lineWidth = 2;

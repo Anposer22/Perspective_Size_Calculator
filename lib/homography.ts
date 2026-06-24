@@ -1,17 +1,22 @@
-// Homography (projective) calibration utilities.
+// Homography (projective) calibration from known-length line segments.
 //
-// We map IMAGE pixel coordinates -> real-world plane coordinates (mm).
-// A single rectangle of known width/height fully determines the 8-DOF
-// homography. Extra known-length segments are optional constraints used to
-// refine the fit by least squares, averaging out clicking noise and lens
-// distortion.
+// We map IMAGE pixel coordinates -> real-world plane coordinates (mm) with an
+// 8-DOF homography. The user draws line segments anywhere on the image (they do
+// NOT need to form a rectangle) and tells us the real length of each. The
+// homography is fit by nonlinear least squares so that every segment, when
+// reprojected to the world plane, matches its known length.
+//
+// Degrees of freedom: a homography has 8. Rigid motion of the world frame
+// (rotation + translation = 3 DOF) does not affect any length, so it is an
+// irrelevant gauge freedom. That leaves 5 meaningful DOF, i.e. at least 5
+// length constraints are needed; we ask for a few more for stability and to get
+// a meaningful residual. Levenberg-Marquardt damping handles the gauge freedom.
 
 export type Point = { x: number; y: number };
+export type Matrix3 = number[]; // row-major length-9
 
-// 3x3 matrix as a flat length-9 array, row-major.
-export type Matrix3 = number[];
+export const MIN_CALIBRATION_LINES = 6;
 
-/** Apply a homography to a 2D point. */
 export function applyHomography(H: Matrix3, p: Point): Point {
   const x = H[0] * p.x + H[1] * p.y + H[2];
   const y = H[3] * p.x + H[4] * p.y + H[5];
@@ -19,52 +24,226 @@ export function applyHomography(H: Matrix3, p: Point): Point {
   return { x: x / w, y: y / w };
 }
 
-/** Euclidean distance between two points. */
 export function dist(a: Point, b: Point): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-/**
- * Solve the exact homography mapping 4 source points to 4 destination points.
- * Sets h33 = 1 and solves the resulting 8x8 linear system via Gaussian
- * elimination with partial pivoting.
- */
-export function computeHomography4(src: Point[], dst: Point[]): Matrix3 | null {
-  if (src.length !== 4 || dst.length !== 4) return null;
-
-  // Build 8x8 system A h = b, with h = [h11..h32], h33 fixed to 1.
-  const A: number[][] = [];
-  const b: number[] = [];
-  for (let i = 0; i < 4; i++) {
-    const { x, y } = src[i];
-    const { x: X, y: Y } = dst[i];
-    A.push([x, y, 1, 0, 0, 0, -X * x, -X * y]);
-    b.push(X);
-    A.push([0, 0, 0, x, y, 1, -Y * x, -Y * y]);
-    b.push(Y);
-  }
-
-  const h = solveLinearSystem(A, b);
-  if (!h) return null;
-  return [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1];
+export function measureLength(H: Matrix3, a: Point, b: Point): number {
+  return dist(applyHomography(H, a), applyHomography(H, b));
 }
 
-/** Gaussian elimination with partial pivoting. Solves A x = b (n x n). */
+function matMul3(A: Matrix3, B: Matrix3): Matrix3 {
+  const C = new Array(9).fill(0);
+  for (let r = 0; r < 3; r++)
+    for (let c = 0; c < 3; c++)
+      for (let k = 0; k < 3; k++) C[r * 3 + c] += A[r * 3 + k] * B[k * 3 + c];
+  return C;
+}
+
+export type CalibLine = { a: Point; b: Point; length: number };
+
+export type CalibrationResult = {
+  H: Matrix3;
+  rmsError: number; // RMS relative error (%) across all calibration lines
+  maxError: number; // worst relative error (%)
+};
+
+// Build a homography (8 params, h33 = 1) from a flat parameter vector.
+function paramsToH(p: number[]): Matrix3 {
+  return [p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], 1];
+}
+
+/**
+ * Calibrate the image->world homography from known-length segments.
+ * Returns null if there are too few lines or the fit fails.
+ */
+export function calibrateFromLengths(
+  lines: CalibLine[]
+): CalibrationResult | null {
+  if (lines.length < MIN_CALIBRATION_LINES) return null;
+
+  // --- Hartley normalization of image coordinates (improves conditioning) ---
+  const pts: Point[] = [];
+  for (const l of lines) {
+    pts.push(l.a, l.b);
+  }
+  let cx = 0,
+    cy = 0;
+  for (const p of pts) {
+    cx += p.x;
+    cy += p.y;
+  }
+  cx /= pts.length;
+  cy /= pts.length;
+  let meanDist = 0;
+  for (const p of pts) meanDist += Math.hypot(p.x - cx, p.y - cy);
+  meanDist /= pts.length;
+  if (meanDist < 1e-9) return null;
+  const s = 1 / meanDist;
+  const N: Matrix3 = [s, 0, -s * cx, 0, s, -s * cy, 0, 0, 1];
+
+  const norm = (p: Point): Point => ({
+    x: s * (p.x - cx),
+    y: s * (p.y - cy),
+  });
+  const nLines = lines.map((l) => ({
+    a: norm(l.a),
+    b: norm(l.b),
+    length: l.length,
+  }));
+
+  // Residuals: relative length error of each segment (in normalized image
+  // space mapped to world via Hprime).
+  const residuals = (p: number[]): number[] => {
+    const H = paramsToH(p);
+    const r: number[] = [];
+    for (const l of nLines) {
+      const computed = dist(applyHomography(H, l.a), applyHomography(H, l.b));
+      r.push((computed - l.length) / l.length);
+    }
+    return r;
+  };
+
+  // --- Initialization: pure similarity (scale only, no perspective) ---
+  let scaleSum = 0;
+  let scaleN = 0;
+  for (const l of nLines) {
+    const d = dist(l.a, l.b);
+    if (d > 1e-9) {
+      scaleSum += l.length / d;
+      scaleN++;
+    }
+  }
+  const alpha = scaleN ? scaleSum / scaleN : 1;
+
+  const baseInit = [alpha, 0, 0, 0, alpha, 0, 0, 0];
+
+  // Try the base init plus a few perspective-perturbed restarts; keep the best.
+  const restarts: number[][] = [baseInit];
+  const perturb = [0.05, -0.05, 0.1, -0.1];
+  for (const a of perturb)
+    for (const b of perturb) {
+      restarts.push([alpha, 0, 0, 0, alpha, 0, a, b]);
+    }
+
+  let best: { p: number[]; cost: number } | null = null;
+  for (const init of restarts) {
+    const res = levenbergMarquardt(residuals, init, 120);
+    if (!best || res.cost < best.cost) best = res;
+  }
+  if (!best) return null;
+
+  const Hprime = paramsToH(best.p);
+  const H = matMul3(Hprime, N); // image -> world
+
+  // Error metrics in real (un-normalized) terms.
+  let sumSq = 0;
+  let max = 0;
+  for (const l of lines) {
+    const computed = measureLength(H, l.a, l.b);
+    const rel = Math.abs(computed - l.length) / l.length;
+    sumSq += rel * rel;
+    if (rel > max) max = rel;
+  }
+  return {
+    H,
+    rmsError: Math.sqrt(sumSq / lines.length) * 100,
+    maxError: max * 100,
+  };
+}
+
+// --- Levenberg-Marquardt least squares -------------------------------------
+
+function levenbergMarquardt(
+  residualFn: (p: number[]) => number[],
+  p0: number[],
+  maxIter: number
+): { p: number[]; cost: number } {
+  const n = p0.length;
+  let p = p0.slice();
+  let r = residualFn(p);
+  let cost = sumSq(r);
+  let lambda = 1e-3;
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    const J = numericJacobian(residualFn, p, r);
+    const m = r.length;
+    // A = JtJ (n x n), g = Jtr (n)
+    const A: number[][] = Array.from({ length: n }, () => new Array(n).fill(0));
+    const g: number[] = new Array(n).fill(0);
+    for (let i = 0; i < m; i++) {
+      for (let a = 0; a < n; a++) {
+        g[a] += J[i][a] * r[i];
+        for (let b = 0; b < n; b++) A[a][b] += J[i][a] * J[i][b];
+      }
+    }
+
+    let improved = false;
+    for (let tries = 0; tries < 10; tries++) {
+      // Damped normal equations: (A + lambda*diag(A)) d = -g
+      const Ad = A.map((row, i) =>
+        row.map((v, j) => (i === j ? v + lambda * (Math.abs(v) + 1e-9) : v))
+      );
+      const neg = g.map((v) => -v);
+      const d = solveLinearSystem(Ad, neg);
+      if (!d) {
+        lambda *= 3;
+        continue;
+      }
+      const pTry = p.map((v, i) => v + d[i]);
+      const rTry = residualFn(pTry);
+      const costTry = sumSq(rTry);
+      if (costTry < cost) {
+        p = pTry;
+        r = rTry;
+        const rel = (cost - costTry) / Math.max(cost, 1e-30);
+        cost = costTry;
+        lambda = Math.max(lambda * 0.5, 1e-12);
+        improved = true;
+        if (rel < 1e-8) return { p, cost };
+        break;
+      }
+      lambda *= 3;
+      if (lambda > 1e12) return { p, cost };
+    }
+    if (!improved) break;
+  }
+  return { p, cost };
+}
+
+function numericJacobian(
+  residualFn: (p: number[]) => number[],
+  p: number[],
+  r0: number[]
+): number[][] {
+  const n = p.length;
+  const m = r0.length;
+  const J: number[][] = Array.from({ length: m }, () => new Array(n).fill(0));
+  for (let j = 0; j < n; j++) {
+    const eps = 1e-6 * (Math.abs(p[j]) + 1e-3);
+    const pj = p.slice();
+    pj[j] += eps;
+    const rj = residualFn(pj);
+    for (let i = 0; i < m; i++) J[i][j] = (rj[i] - r0[i]) / eps;
+  }
+  return J;
+}
+
+function sumSq(v: number[]): number {
+  let s = 0;
+  for (const x of v) s += x * x;
+  return s;
+}
+
 function solveLinearSystem(A: number[][], b: number[]): number[] | null {
   const n = b.length;
-  // Augmented matrix.
   const M = A.map((row, i) => [...row, b[i]]);
-
   for (let col = 0; col < n; col++) {
-    // Pivot.
     let pivot = col;
-    for (let r = col + 1; r < n; r++) {
+    for (let r = col + 1; r < n; r++)
       if (Math.abs(M[r][col]) > Math.abs(M[pivot][col])) pivot = r;
-    }
-    if (Math.abs(M[pivot][col]) < 1e-12) return null;
+    if (Math.abs(M[pivot][col]) < 1e-15) return null;
     [M[col], M[pivot]] = [M[pivot], M[col]];
-
-    // Eliminate.
     for (let r = 0; r < n; r++) {
       if (r === col) continue;
       const f = M[r][col] / M[col][col];
@@ -72,143 +251,7 @@ function solveLinearSystem(A: number[][], b: number[]): number[] | null {
       for (let c = col; c <= n; c++) M[r][c] -= f * M[col][c];
     }
   }
-
   const x = new Array(n);
   for (let i = 0; i < n; i++) x[i] = M[i][n] / M[i][i];
   return x;
-}
-
-export type LengthConstraint = {
-  a: Point; // image-space endpoint
-  b: Point; // image-space endpoint
-  length: number; // known real-world length (mm)
-};
-
-export type CalibrationResult = {
-  H: Matrix3;
-  rmsError: number; // RMS relative error (%) across all known constraints
-  maxError: number; // worst relative error (%) across all known constraints
-};
-
-/**
- * Refine a homography using extra known-length constraints (least squares).
- *
- * Starts from the exact 4-corner solution and runs a small gradient-descent
- * refinement that minimizes:
- *   - reprojection error of the 4 rectangle corners (kept tight), plus
- *   - squared relative error of each known-length segment.
- *
- * Returns the refined homography and residual error metrics.
- */
-export function calibrate(
-  corners: Point[], // 4 image-space corners: TL, TR, BR, BL
-  rectWidth: number,
-  rectHeight: number,
-  extraConstraints: LengthConstraint[] = []
-): CalibrationResult | null {
-  const dst: Point[] = [
-    { x: 0, y: 0 },
-    { x: rectWidth, y: 0 },
-    { x: rectWidth, y: rectHeight },
-    { x: 0, y: rectHeight },
-  ];
-
-  const H0 = computeHomography4(corners, dst);
-  if (!H0) return null;
-
-  // All constraints used for scoring: the rectangle's own four edges plus any
-  // user-supplied extra segments.
-  const allConstraints: LengthConstraint[] = [
-    { a: corners[0], b: corners[1], length: rectWidth },
-    { a: corners[1], b: corners[2], length: rectHeight },
-    { a: corners[2], b: corners[3], length: rectWidth },
-    { a: corners[3], b: corners[0], length: rectHeight },
-    ...extraConstraints,
-  ];
-
-  if (extraConstraints.length === 0) {
-    return { H: H0, ...errorMetrics(H0, allConstraints) };
-  }
-
-  // Cost: corner reprojection error (anchors the world frame & scale) plus
-  // relative length error over every constraint.
-  const cost = (H: Matrix3): number => {
-    let c = 0;
-    for (let i = 0; i < 4; i++) {
-      const p = applyHomography(H, corners[i]);
-      c += (p.x - dst[i].x) ** 2 + (p.y - dst[i].y) ** 2;
-    }
-    for (const k of allConstraints) {
-      const la = applyHomography(H, k.a);
-      const lb = applyHomography(H, k.b);
-      const measured = dist(la, lb);
-      const rel = (measured - k.length) / k.length;
-      // Weight length constraints so they meaningfully shape the fit.
-      c += (rel * Math.max(rectWidth, rectHeight)) ** 2;
-    }
-    return c;
-  };
-
-  let H = [...H0];
-  let step = 1e-4;
-  let prev = cost(H);
-  for (let iter = 0; iter < 400; iter++) {
-    const grad = numericGradient(cost, H);
-    const norm = Math.hypot(...grad);
-    if (norm < 1e-12) break;
-    // Backtracking line search.
-    let moved = false;
-    for (let s = 0; s < 8; s++) {
-      const trial = H.map((v, i) => v - (step * grad[i]) / norm);
-      const c = cost(trial);
-      if (c < prev) {
-        H = trial;
-        prev = c;
-        step *= 1.5;
-        moved = true;
-        break;
-      }
-      step *= 0.5;
-    }
-    if (!moved && step < 1e-10) break;
-  }
-
-  return { H, ...errorMetrics(H, allConstraints) };
-}
-
-function numericGradient(f: (H: Matrix3) => number, H: Matrix3): number[] {
-  const eps = 1e-6;
-  const base = f(H);
-  const g = new Array(9).fill(0);
-  for (let i = 0; i < 9; i++) {
-    const h2 = [...H];
-    h2[i] += eps;
-    g[i] = (f(h2) - base) / eps;
-  }
-  return g;
-}
-
-function errorMetrics(
-  H: Matrix3,
-  constraints: LengthConstraint[]
-): { rmsError: number; maxError: number } {
-  let sumSq = 0;
-  let max = 0;
-  for (const k of constraints) {
-    const la = applyHomography(H, k.a);
-    const lb = applyHomography(H, k.b);
-    const measured = dist(la, lb);
-    const rel = Math.abs(measured - k.length) / k.length;
-    sumSq += rel * rel;
-    if (rel > max) max = rel;
-  }
-  return {
-    rmsError: Math.sqrt(sumSq / constraints.length) * 100,
-    maxError: max * 100,
-  };
-}
-
-/** Measure the real-world length (mm) of an image-space segment. */
-export function measureLength(H: Matrix3, a: Point, b: Point): number {
-  return dist(applyHomography(H, a), applyHomography(H, b));
 }

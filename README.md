@@ -4,24 +4,25 @@ Aplicación web (sin backend) para **medir el tamaño real de objetos en una fot
 a partir de un objeto de referencia de dimensiones conocidas.
 
 Funciona corrigiendo la perspectiva del plano mediante una **homografía**: el
-usuario marca las 4 esquinas de un objeto rectangular conocido e introduce su
-ancho y alto reales; con eso se calibra todo el plano y se puede medir cualquier
-otro objeto que esté **en el mismo plano**.
+usuario traza varias líneas sobre objetos de tamaño conocido e indica su
+longitud real. Con esas medidas se calibra todo el plano (mínimos cuadrados no
+lineales) y se puede medir cualquier otro objeto que esté **en el mismo plano**.
 
 ## Uso
 
 1. **Carga una imagen**: pégala con `Ctrl/Cmd+V` desde el portapapeles o súbela.
-2. **Calibra**: pulsa "Marcar esquinas" y haz clic en las 4 esquinas del objeto
-   rectangular conocido (en orden: sup-izq, sup-der, inf-der, inf-izq).
-   Introduce su ancho y alto reales en mm.
-3. **(Opcional) Referencias extra**: añade más segmentos de longitud conocida
-   para afinar la precisión. La homografía se reajusta por mínimos cuadrados.
-4. **Mide**: traza segmentos entre dos puntos. La longitud real aparece en mm.
+2. **Calibra**: pulsa "Añadir línea" y traza segmentos sobre medidas conocidas,
+   indicando la longitud real de cada uno. No hace falta que formen un
+   rectángulo. Hace falta un **mínimo de 6 líneas**; cuantas más y más variadas
+   (distintas orientaciones y zonas de la imagen), mayor precisión.
+3. **Mide**: traza segmentos entre dos puntos. La longitud real aparece en mm.
 
-### Atajos
+### Controles
 
-- Rueda del ratón: **zoom** (hacia el cursor).
-- Arrastrar con `Espacio` o botón central: **mover** (pan).
+- **Clic**: colocar un punto (en modo añadir/medir).
+- **Arrastrar un punto**: moverlo (recalibra/recalcula en vivo).
+- **Arrastrar la imagen**: desplazarse (pan). También botón central o `Espacio`.
+- **Rueda**: zoom hacia el cursor.
 - Una **lupa** aparece al colocar puntos para precisión sub-píxel.
 
 ## Precisión y limitaciones
