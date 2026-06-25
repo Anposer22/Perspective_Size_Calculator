@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   calibrateFromLengths,
   measureLength,
+  convexHull,
+  pointInPolygon,
   MIN_CALIBRATION_LINES,
   type CalibrationResult,
   type CalibLine,
@@ -41,7 +43,11 @@ export default function Home() {
   const [calib, setCalib] = useState<CalibrationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const cursorRef = useRef<{ img: Point; screen: Point } | null>(null);
+  const cursorRef = useRef<{
+    img: Point;
+    screen: Point;
+    snap?: Point | null;
+  } | null>(null);
   const idRef = useRef(1);
 
   // Live mutable copies for use inside pointer handlers (avoid stale closures).
@@ -195,12 +201,26 @@ export default function Home() {
     }
   };
 
+  const refToPoint = (ref: DragRef): Point | null => {
+    const { calibLines, measurements, pending } = stateRef.current;
+    if (ref.type === "pending") return pending[ref.index] ?? null;
+    if (ref.type === "calib") {
+      const l = calibLines.find((x) => x.id === ref.id);
+      return l ? l[ref.end] : null;
+    }
+    const m = measurements.find((x) => x.id === ref.id);
+    return m ? m[ref.end] : null;
+  };
+
   // ---- Pointer interaction -------------------------------------------------
 
-  // Gesture state lives in refs so handlers stay stable.
-  const dragRef = useRef<DragRef | null>(null);
+  // Gesture state lives in refs so handlers stay stable. A press is ambiguous
+  // until the pointer moves: a small move on a handle => drag it; a small move
+  // on empty space => pan; no move (a click) => place a point (snapped to a
+  // nearby handle if there is one, so lines can be continued point-to-point).
   const gestureRef = useRef<{
-    decided: "none" | "pan" | "drag";
+    decided: "none" | "pan" | "movehandle";
+    handleHit: DragRef | null;
     startScreen: Point;
     startImg: Point;
     startOffset: { x: number; y: number };
@@ -235,19 +255,13 @@ export default function Home() {
 
     // Middle button or space => always pan.
     const forcePan = e.button === 1 || spaceDown.current;
-
-    if (e.button === 0 && !forcePan) {
-      const hit = hitTestHandle(local);
-      if (hit) {
-        dragRef.current = hit;
-        return;
-      }
-    }
     if (e.button !== 0 && e.button !== 1) return;
 
+    const hit = forcePan ? null : hitTestHandle(local);
     const v = viewRef.current;
     gestureRef.current = {
       decided: "none",
+      handleHit: hit,
       startScreen: local,
       startImg: screenToImage(local.x, local.y),
       startOffset: { x: v.offsetX, y: v.offsetY },
@@ -258,13 +272,7 @@ export default function Home() {
   const onPointerMove = (e: React.PointerEvent) => {
     if (!stateRef.current.hasImage) return;
     const local = getLocal(e);
-
-    if (dragRef.current) {
-      moveHandle(dragRef.current, screenToImage(local.x, local.y));
-      cursorRef.current = { img: screenToImage(local.x, local.y), screen: local };
-      draw();
-      return;
-    }
+    const img = screenToImage(local.x, local.y);
 
     const g = gestureRef.current;
     if (g) {
@@ -272,7 +280,14 @@ export default function Home() {
       const dy = local.y - g.startScreen.y;
       if (g.decided === "none") {
         if (g.forcePan) g.decided = "pan";
-        else if (dx * dx + dy * dy > 16) g.decided = "pan";
+        else if (dx * dx + dy * dy > 16)
+          g.decided = g.handleHit ? "movehandle" : "pan";
+      }
+      if (g.decided === "movehandle" && g.handleHit) {
+        moveHandle(g.handleHit, img);
+        cursorRef.current = { img, screen: local, snap: null };
+        draw();
+        return;
       }
       if (g.decided === "pan") {
         viewRef.current.offsetX = g.startOffset.x + dx;
@@ -283,7 +298,14 @@ export default function Home() {
       }
     }
 
-    cursorRef.current = { img: screenToImage(local.x, local.y), screen: local };
+    // Hover: show a snap indicator when near an existing handle.
+    const hover = hitTestHandle(local);
+    const snapPt = hover ? refToPoint(hover) : null;
+    cursorRef.current = {
+      img,
+      screen: local,
+      snap: snapPt ? imageToScreen(snapPt) : null,
+    };
     draw();
   };
 
@@ -291,17 +313,14 @@ export default function Home() {
     try {
       (e.target as Element).releasePointerCapture(e.pointerId);
     } catch {}
-
-    if (dragRef.current) {
-      dragRef.current = null;
-      return;
-    }
     const g = gestureRef.current;
     gestureRef.current = null;
     if (!g) return;
-    // A click (never became a pan) places a point in the active mode.
+    // A click (no drag, no pan) places a point in the active mode, snapping to
+    // a handle under the cursor so lines can be continued point-to-point.
     if (g.decided === "none" && !g.forcePan) {
-      placePoint(g.startImg);
+      const snapped = g.handleHit ? refToPoint(g.handleHit) : null;
+      placePoint(snapped ?? g.startImg);
     }
   };
 
@@ -392,6 +411,27 @@ export default function Home() {
       img.height * v.scale
     );
 
+    // Calibrated region (convex hull of calibration endpoints). Measuring
+    // inside it is interpolation (reliable); outside is extrapolation (risky).
+    const hullImg =
+      calibLines.length >= 2
+        ? convexHull(calibLines.flatMap((l) => [l.a, l.b]))
+        : [];
+    if (calib && hullImg.length >= 3) {
+      const hs = hullImg.map(imageToScreen);
+      ctx.save();
+      ctx.beginPath();
+      hs.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+      ctx.closePath();
+      ctx.fillStyle = "rgba(70,198,106,0.08)";
+      ctx.fill();
+      ctx.setLineDash([5, 5]);
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(70,198,106,0.5)";
+      ctx.stroke();
+      ctx.restore();
+    }
+
     // Calibration lines (green) with their known length.
     calibLines.forEach((l) => {
       const a = imageToScreen(l.a);
@@ -402,16 +442,22 @@ export default function Home() {
       drawLabel(ctx, midpoint(a, b), `${l.length} mm`, "#46c66a");
     });
 
-    // Measurements (orange) with computed length.
+    // Measurements: orange if inside the calibrated region, red + warning if
+    // extrapolated (one or both endpoints outside the hull).
     measurements.forEach((m) => {
+      const extrap =
+        hullImg.length >= 3 &&
+        (!pointInPolygon(m.a, hullImg) || !pointInPolygon(m.b, hullImg));
+      const color = extrap ? "#ff5d5d" : "#ff8a3d";
       const a = imageToScreen(m.a);
       const b = imageToScreen(m.b);
-      drawSegment(ctx, a, b, "#ff8a3d");
-      drawHandle(ctx, a, "#ff8a3d");
-      drawHandle(ctx, b, "#ff8a3d");
+      drawSegment(ctx, a, b, color);
+      drawHandle(ctx, a, color);
+      drawHandle(ctx, b, color);
       if (calib) {
         const mm = measureLength(calib.H, m.a, m.b);
-        drawLabel(ctx, midpoint(a, b), `${mm.toFixed(1)} mm`, "#ff8a3d");
+        const text = extrap ? `${mm.toFixed(1)} mm ⚠` : `${mm.toFixed(1)} mm`;
+        drawLabel(ctx, midpoint(a, b), text, color);
       }
     });
 
@@ -433,9 +479,18 @@ export default function Home() {
       drawHandle(ctx, b, "#ffffff");
     }
 
+    // Snap indicator: ring around the handle the next click would reuse.
+    if (cur?.snap && gestureRef.current?.decided !== "movehandle") {
+      ctx.beginPath();
+      ctx.arc(cur.snap.x, cur.snap.y, 9, 0, Math.PI * 2);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#ffd24d";
+      ctx.stroke();
+    }
+
     // Crosshair + loupe while placing points.
     const placing = mode === "addcalib" || mode === "measure";
-    if (cur && placing && !dragRef.current) {
+    if (cur && placing && gestureRef.current?.decided !== "movehandle") {
       drawCrosshair(ctx, cur.screen, cw, ch);
       drawLoupe(ctx, img, v, cur, cw, ch);
     }
@@ -457,6 +512,17 @@ export default function Home() {
 
   const calibrated = !!calib;
   const linesLeft = Math.max(0, MIN_CALIBRATION_LINES - calibLines.length);
+
+  const hullImg =
+    calibLines.length >= 2
+      ? convexHull(calibLines.flatMap((l) => [l.a, l.b]))
+      : [];
+  const anyExtrapolated =
+    calibrated &&
+    hullImg.length >= 3 &&
+    measurements.some(
+      (m) => !pointInPolygon(m.a, hullImg) || !pointInPolygon(m.b, hullImg)
+    );
 
   const resetCalibration = () => {
     setCalibLines([]);
@@ -531,10 +597,11 @@ export default function Home() {
             <div className="body">
               <div className="title">Calibra con medidas conocidas</div>
               <div className="desc">
-                Traza líneas sobre objetos de tamaño conocido e indica su
-                longitud real. No hace falta que formen un rectángulo. Mínimo{" "}
-                <b>{MIN_CALIBRATION_LINES}</b> líneas; añade más (en distintas
-                orientaciones y zonas) para más precisión.
+                Traza líneas sobre medidas conocidas e indica su longitud real.
+                No hace falta que formen un rectángulo. Mínimo{" "}
+                <b>{MIN_CALIBRATION_LINES}</b>. <b>Clave:</b> repártelas por toda
+                la imagen, también <b>cerca de lo que vas a medir</b> — solo se
+                mide con fiabilidad dentro de la zona calibrada (recuadro verde).
               </div>
 
               <div className="row" style={{ marginTop: 10 }}>
@@ -643,6 +710,13 @@ export default function Home() {
               <div className="desc">
                 Con la imagen calibrada, traza segmentos entre dos puntos.
               </div>
+              {anyExtrapolated && (
+                <div className="error-banner" style={{ marginTop: 10 }}>
+                  ⚠ Hay medidas <b>fuera de la zona calibrada</b> (en rojo). Ahí
+                  el resultado es poco fiable. Añade líneas de calibración cerca
+                  de esos objetos y vuelve a medir.
+                </div>
+              )}
               <div className="row" style={{ marginTop: 10 }}>
                 <button
                   className={`btn primary ${mode === "measure" ? "active" : ""}`}

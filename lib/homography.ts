@@ -32,6 +32,57 @@ export function measureLength(H: Matrix3, a: Point, b: Point): number {
   return dist(applyHomography(H, a), applyHomography(H, b));
 }
 
+// --- Calibrated-region geometry --------------------------------------------
+
+/** Convex hull (Andrew's monotone chain), returned counter-clockwise. */
+export function convexHull(points: Point[]): Point[] {
+  const pts = points
+    .slice()
+    .sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x));
+  if (pts.length < 3) return pts;
+  const cross = (o: Point, a: Point, b: Point) =>
+    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const lower: Point[] = [];
+  for (const p of pts) {
+    while (
+      lower.length >= 2 &&
+      cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0
+    )
+      lower.pop();
+    lower.push(p);
+  }
+  const upper: Point[] = [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (
+      upper.length >= 2 &&
+      cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0
+    )
+      upper.pop();
+    upper.push(p);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+/** Test whether a point lies inside (or on) a polygon. */
+export function pointInPolygon(p: Point, poly: Point[]): boolean {
+  if (poly.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x,
+      yi = poly[i].y,
+      xj = poly[j].x,
+      yj = poly[j].y;
+    const intersect =
+      yi > p.y !== yj > p.y &&
+      p.x < ((xj - xi) * (p.y - yi)) / (yj - yi + 1e-12) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 function matMul3(A: Matrix3, B: Matrix3): Matrix3 {
   const C = new Array(9).fill(0);
   for (let r = 0; r < 3; r++)
