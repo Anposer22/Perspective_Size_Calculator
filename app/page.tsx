@@ -2,28 +2,29 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  calibrateFromLengths,
+  calibrate,
+  calibrationStatus,
   measureLength,
-  convexHull,
-  pointInPolygon,
-  MIN_CALIBRATION_LINES,
+  MIN_LINES_PER_DIRECTION,
   type CalibrationResult,
   type CalibLine,
   type Point,
 } from "@/lib/homography";
 
-type Mode = "idle" | "addcalib" | "measure";
+type Mode = "idle" | "dir1" | "dir2" | "measure";
 
-type Line = { id: number; a: Point; b: Point; length: number };
+type Line = { id: number; a: Point; b: Point; dir: 1 | 2; length?: number };
 type Measurement = { id: number; a: Point; b: Point };
 
-// A handle that can be dragged. Refers back to the data it belongs to.
 type DragRef =
   | { type: "calib"; id: number; end: "a" | "b" }
   | { type: "measure"; id: number; end: "a" | "b" }
   | { type: "pending"; index: number };
 
-const HANDLE_HIT_RADIUS = 10; // screen px
+const HANDLE_HIT_RADIUS = 10;
+const DIR1_COLOR = "#4da3ff";
+const DIR2_COLOR = "#c77dff";
+const MEAS_COLOR = "#ff8a3d";
 
 export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -50,14 +51,7 @@ export default function Home() {
   } | null>(null);
   const idRef = useRef(1);
 
-  // Live mutable copies for use inside pointer handlers (avoid stale closures).
-  const stateRef = useRef({
-    mode,
-    calibLines,
-    measurements,
-    pending,
-    hasImage,
-  });
+  const stateRef = useRef({ mode, calibLines, measurements, pending, hasImage });
   useEffect(() => {
     stateRef.current = { mode, calibLines, measurements, pending, hasImage };
   }, [mode, calibLines, measurements, pending, hasImage]);
@@ -91,11 +85,11 @@ export default function Home() {
         setPending([]);
         setPendingLen("");
         setCalib(null);
-        setMode("addcalib");
+        setMode("dir1");
         fitImage();
         URL.revokeObjectURL(url);
       };
-      img.onerror = () => setError("No se pudo cargar la imagen.");
+      img.onerror = () => setError("Could not load the image.");
       img.src = url;
     },
     [fitImage]
@@ -140,20 +134,21 @@ export default function Home() {
   // ---- Calibration recompute ----------------------------------------------
 
   useEffect(() => {
-    if (calibLines.length < MIN_CALIBRATION_LINES) {
-      setCalib(null);
-      return;
-    }
     const lines: CalibLine[] = calibLines.map((l) => ({
       a: l.a,
       b: l.b,
+      dir: l.dir,
       length: l.length,
     }));
-    const result = calibrateFromLengths(lines);
+    if (!calibrationStatus(lines).ready) {
+      setCalib(null);
+      return;
+    }
+    const result = calibrate(lines);
     if (!result) {
       setCalib(null);
       setError(
-        "La calibración no converge: prueba a usar líneas en orientaciones y posiciones más variadas."
+        "Calibration failed. Make sure the two directions are clearly different and the lines are not collinear."
       );
     } else {
       setError(null);
@@ -161,7 +156,7 @@ export default function Home() {
     }
   }, [calibLines]);
 
-  // ---- Hit testing for draggable handles -----------------------------------
+  // ---- Hit testing & dragging ----------------------------------------------
 
   const hitTestHandle = (screen: Point): DragRef | null => {
     const { calibLines, measurements, pending } = stateRef.current;
@@ -172,33 +167,21 @@ export default function Home() {
       const dy = s.y - screen.y;
       return dx * dx + dy * dy <= r2;
     };
-    // Pending points first (most recently placed, on top).
-    for (let i = pending.length - 1; i >= 0; i--) {
+    for (let i = pending.length - 1; i >= 0; i--)
       if (near(pending[i])) return { type: "pending", index: i };
-    }
     for (let i = measurements.length - 1; i >= 0; i--) {
-      if (near(measurements[i].b)) return { type: "measure", id: measurements[i].id, end: "b" };
-      if (near(measurements[i].a)) return { type: "measure", id: measurements[i].id, end: "a" };
+      if (near(measurements[i].b))
+        return { type: "measure", id: measurements[i].id, end: "b" };
+      if (near(measurements[i].a))
+        return { type: "measure", id: measurements[i].id, end: "a" };
     }
     for (let i = calibLines.length - 1; i >= 0; i--) {
-      if (near(calibLines[i].b)) return { type: "calib", id: calibLines[i].id, end: "b" };
-      if (near(calibLines[i].a)) return { type: "calib", id: calibLines[i].id, end: "a" };
+      if (near(calibLines[i].b))
+        return { type: "calib", id: calibLines[i].id, end: "b" };
+      if (near(calibLines[i].a))
+        return { type: "calib", id: calibLines[i].id, end: "a" };
     }
     return null;
-  };
-
-  const moveHandle = (ref: DragRef, img: Point) => {
-    if (ref.type === "pending") {
-      setPending((prev) => prev.map((p, i) => (i === ref.index ? img : p)));
-    } else if (ref.type === "calib") {
-      setCalibLines((prev) =>
-        prev.map((l) => (l.id === ref.id ? { ...l, [ref.end]: img } : l))
-      );
-    } else {
-      setMeasurements((prev) =>
-        prev.map((m) => (m.id === ref.id ? { ...m, [ref.end]: img } : m))
-      );
-    }
   };
 
   const refToPoint = (ref: DragRef): Point | null => {
@@ -212,12 +195,21 @@ export default function Home() {
     return m ? m[ref.end] : null;
   };
 
+  const moveHandle = (ref: DragRef, img: Point) => {
+    if (ref.type === "pending")
+      setPending((prev) => prev.map((p, i) => (i === ref.index ? img : p)));
+    else if (ref.type === "calib")
+      setCalibLines((prev) =>
+        prev.map((l) => (l.id === ref.id ? { ...l, [ref.end]: img } : l))
+      );
+    else
+      setMeasurements((prev) =>
+        prev.map((m) => (m.id === ref.id ? { ...m, [ref.end]: img } : m))
+      );
+  };
+
   // ---- Pointer interaction -------------------------------------------------
 
-  // Gesture state lives in refs so handlers stay stable. A press is ambiguous
-  // until the pointer moves: a small move on a handle => drag it; a small move
-  // on empty space => pan; no move (a click) => place a point (snapped to a
-  // nearby handle if there is one, so lines can be continued point-to-point).
   const gestureRef = useRef<{
     decided: "none" | "pan" | "movehandle";
     handleHit: DragRef | null;
@@ -252,11 +244,8 @@ export default function Home() {
     if (!stateRef.current.hasImage) return;
     const local = getLocal(e);
     (e.target as Element).setPointerCapture(e.pointerId);
-
-    // Middle button or space => always pan.
     const forcePan = e.button === 1 || spaceDown.current;
     if (e.button !== 0 && e.button !== 1) return;
-
     const hit = forcePan ? null : hitTestHandle(local);
     const v = viewRef.current;
     gestureRef.current = {
@@ -273,7 +262,6 @@ export default function Home() {
     if (!stateRef.current.hasImage) return;
     const local = getLocal(e);
     const img = screenToImage(local.x, local.y);
-
     const g = gestureRef.current;
     if (g) {
       const dx = local.x - g.startScreen.x;
@@ -297,8 +285,6 @@ export default function Home() {
         return;
       }
     }
-
-    // Hover: show a snap indicator when near an existing handle.
     const hover = hitTestHandle(local);
     const snapPt = hover ? refToPoint(hover) : null;
     cursorRef.current = {
@@ -316,8 +302,6 @@ export default function Home() {
     const g = gestureRef.current;
     gestureRef.current = null;
     if (!g) return;
-    // A click (no drag, no pan) places a point in the active mode, snapping to
-    // a handle under the cursor so lines can be continued point-to-point.
     if (g.decided === "none" && !g.forcePan) {
       const snapped = g.handleHit ? refToPoint(g.handleHit) : null;
       placePoint(snapped ?? g.startImg);
@@ -345,31 +329,34 @@ export default function Home() {
 
   const placePoint = (p: Point) => {
     const m = stateRef.current.mode;
-    if (m !== "addcalib" && m !== "measure") return;
-    // In calibration, the 2 points wait for a length before accepting more.
-    if (m === "addcalib" && stateRef.current.pending.length >= 2) return;
+    if (m === "idle") return;
+    if (m !== "measure" && stateRef.current.pending.length >= 2) return;
     setPending((prev) => {
       const next = [...prev, p];
-      if (next.length === 2) {
-        if (m === "measure") {
-          setMeasurements((arr) => [
-            ...arr,
-            { id: idRef.current++, a: next[0], b: next[1] },
-          ]);
-          return [];
-        }
-        // addcalib: hold until length confirmed.
+      if (next.length === 2 && m === "measure") {
+        setMeasurements((arr) => [
+          ...arr,
+          { id: idRef.current++, a: next[0], b: next[1] },
+        ]);
+        return [];
       }
       return next;
     });
   };
 
-  const confirmCalibLine = () => {
+  const confirmLine = () => {
+    const m = stateRef.current.mode;
+    if (pending.length !== 2 || (m !== "dir1" && m !== "dir2")) return;
     const len = parseFloat(pendingLen);
-    if (pending.length !== 2 || !(len > 0)) return;
     setCalibLines((prev) => [
       ...prev,
-      { id: idRef.current++, a: pending[0], b: pending[1], length: len },
+      {
+        id: idRef.current++,
+        a: pending[0],
+        b: pending[1],
+        dir: m === "dir1" ? 1 : 2,
+        length: len > 0 ? len : undefined,
+      },
     ]);
     setPending([]);
     setPendingLen("");
@@ -411,75 +398,52 @@ export default function Home() {
       img.height * v.scale
     );
 
-    // Calibrated region (convex hull of calibration endpoints). Measuring
-    // inside it is interpolation (reliable); outside is extrapolation (risky).
-    const hullImg =
-      calibLines.length >= 2
-        ? convexHull(calibLines.flatMap((l) => [l.a, l.b]))
-        : [];
-    if (calib && hullImg.length >= 3) {
-      const hs = hullImg.map(imageToScreen);
-      ctx.save();
-      ctx.beginPath();
-      hs.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-      ctx.closePath();
-      ctx.fillStyle = "rgba(70,198,106,0.08)";
-      ctx.fill();
-      ctx.setLineDash([5, 5]);
-      ctx.lineWidth = 1;
-      ctx.strokeStyle = "rgba(70,198,106,0.5)";
-      ctx.stroke();
-      ctx.restore();
-    }
-
-    // Calibration lines (green) with their known length.
+    // Calibration lines, colored by direction.
     calibLines.forEach((l) => {
+      const color = l.dir === 1 ? DIR1_COLOR : DIR2_COLOR;
       const a = imageToScreen(l.a);
       const b = imageToScreen(l.b);
-      drawSegment(ctx, a, b, "#46c66a");
-      drawHandle(ctx, a, "#46c66a");
-      drawHandle(ctx, b, "#46c66a");
-      drawLabel(ctx, midpoint(a, b), `${l.length} mm`, "#46c66a");
-    });
-
-    // Measurements: orange if inside the calibrated region, red + warning if
-    // extrapolated (one or both endpoints outside the hull).
-    measurements.forEach((m) => {
-      const extrap =
-        hullImg.length >= 3 &&
-        (!pointInPolygon(m.a, hullImg) || !pointInPolygon(m.b, hullImg));
-      const color = extrap ? "#ff5d5d" : "#ff8a3d";
-      const a = imageToScreen(m.a);
-      const b = imageToScreen(m.b);
       drawSegment(ctx, a, b, color);
       drawHandle(ctx, a, color);
       drawHandle(ctx, b, color);
+      const tag = l.length ? `${l.length} mm` : `Dir ${l.dir}`;
+      drawLabel(ctx, midpoint(a, b), tag, color);
+    });
+
+    // Measurements.
+    measurements.forEach((m) => {
+      const a = imageToScreen(m.a);
+      const b = imageToScreen(m.b);
+      drawSegment(ctx, a, b, MEAS_COLOR);
+      drawHandle(ctx, a, MEAS_COLOR);
+      drawHandle(ctx, b, MEAS_COLOR);
       if (calib) {
         const mm = measureLength(calib.H, m.a, m.b);
-        const text = extrap ? `${mm.toFixed(1)} mm ⚠` : `${mm.toFixed(1)} mm`;
-        drawLabel(ctx, midpoint(a, b), text, color);
+        drawLabel(ctx, midpoint(a, b), `${mm.toFixed(1)} mm`, MEAS_COLOR);
       }
     });
 
-    // Pending point(s) + full-screen guide line.
+    // Pending points + full-screen guide line.
     const cur = cursorRef.current;
+    const penColor =
+      mode === "dir1" ? DIR1_COLOR : mode === "dir2" ? DIR2_COLOR : "#ffffff";
     if (pending.length === 1) {
       const a = imageToScreen(pending[0]);
-      drawHandle(ctx, a, "#ffffff");
+      drawHandle(ctx, a, penColor);
       if (cur) {
         drawExtendedLine(ctx, a, cur.screen, cw, ch);
-        drawSegment(ctx, a, cur.screen, "#ffffff");
+        drawSegment(ctx, a, cur.screen, penColor);
       }
     } else if (pending.length === 2) {
       const a = imageToScreen(pending[0]);
       const b = imageToScreen(pending[1]);
       drawExtendedLine(ctx, a, b, cw, ch);
-      drawSegment(ctx, a, b, "#ffffff");
-      drawHandle(ctx, a, "#ffffff");
-      drawHandle(ctx, b, "#ffffff");
+      drawSegment(ctx, a, b, penColor);
+      drawHandle(ctx, a, penColor);
+      drawHandle(ctx, b, penColor);
     }
 
-    // Snap indicator: ring around the handle the next click would reuse.
+    // Snap ring.
     if (cur?.snap && gestureRef.current?.decided !== "movehandle") {
       ctx.beginPath();
       ctx.arc(cur.snap.x, cur.snap.y, 9, 0, Math.PI * 2);
@@ -489,7 +453,7 @@ export default function Home() {
     }
 
     // Crosshair + loupe while placing points.
-    const placing = mode === "addcalib" || mode === "measure";
+    const placing = mode !== "idle";
     if (cur && placing && gestureRef.current?.decided !== "movehandle") {
       drawCrosshair(ctx, cur.screen, cw, ch);
       drawLoupe(ctx, img, v, cur, cw, ch);
@@ -510,19 +474,16 @@ export default function Home() {
 
   // ---- Derived UI ----------------------------------------------------------
 
+  const status = calibrationStatus(
+    calibLines.map((l) => ({ a: l.a, b: l.b, dir: l.dir, length: l.length }))
+  );
   const calibrated = !!calib;
-  const linesLeft = Math.max(0, MIN_CALIBRATION_LINES - calibLines.length);
 
-  const hullImg =
-    calibLines.length >= 2
-      ? convexHull(calibLines.flatMap((l) => [l.a, l.b]))
-      : [];
-  const anyExtrapolated =
-    calibrated &&
-    hullImg.length >= 3 &&
-    measurements.some(
-      (m) => !pointInPolygon(m.a, hullImg) || !pointInPolygon(m.b, hullImg)
-    );
+  const toggleMode = (m: Mode) => {
+    setPending([]);
+    setPendingLen("");
+    setMode((cur) => (cur === m ? "idle" : m));
+  };
 
   const resetCalibration = () => {
     setCalibLines([]);
@@ -531,11 +492,14 @@ export default function Home() {
     setCalib(null);
   };
 
-  const toggleMode = (m: Mode) => {
-    setPending([]);
-    setPendingLen("");
-    setMode((cur) => (cur === m ? "idle" : m));
-  };
+  const dirHint =
+    mode === "dir1" || mode === "dir2"
+      ? pending.length === 0
+        ? "Click the first point of an edge along this direction."
+        : pending.length === 1
+        ? "Click the second point."
+        : "Optionally enter its real length, then add the line."
+      : "";
 
   // -------------------------------------------------------------------------
 
@@ -543,32 +507,32 @@ export default function Home() {
     <div className="app">
       <header className="header">
         <div className="logo" />
-        <h1>Calculadora de tamaños por perspectiva</h1>
+        <h1>Perspective Size Calculator</h1>
         <div className="spacer" />
         {calibrated ? (
           <span className={`pill ${calib!.rmsError < 3 ? "good" : "warn"}`}>
-            Calibrado · error {calib!.rmsError.toFixed(1)}%
+            Calibrated · fit error {calib!.rmsError.toFixed(1)}%
           </span>
         ) : (
-          <span className="pill">Sin calibrar</span>
+          <span className="pill">Not calibrated</span>
         )}
       </header>
 
       <aside className="sidebar">
         {error && <div className="error-banner">{error}</div>}
 
-        {/* Step 1: image */}
+        {/* Step 1 */}
         <div className="card">
           <div className={`step ${hasImage ? "done" : "active"}`}>
             <div className="num">1</div>
             <div className="body">
-              <div className="title">Carga una imagen</div>
+              <div className="title">Load an image</div>
               <div className="desc">
-                Pega con <kbd>Ctrl/Cmd</kbd>+<kbd>V</kbd> o sube un archivo.
+                Paste with <kbd>Ctrl/Cmd</kbd>+<kbd>V</kbd> or upload a file.
               </div>
               <div className="row" style={{ marginTop: 10 }}>
                 <label className="btn">
-                  Subir archivo
+                  Upload file
                   <input
                     type="file"
                     accept="image/*"
@@ -578,7 +542,7 @@ export default function Home() {
                 </label>
                 {hasImage && (
                   <button className="btn ghost" onClick={fitImage}>
-                    Encajar
+                    Fit
                   </button>
                 )}
               </div>
@@ -586,7 +550,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Step 2: calibration via free known-length lines */}
+        {/* Step 2: calibration via vanishing points */}
         <div className="card">
           <div
             className={`step ${
@@ -595,89 +559,110 @@ export default function Home() {
           >
             <div className="num">2</div>
             <div className="body">
-              <div className="title">Calibra con medidas conocidas</div>
+              <div className="title">Calibrate the plane</div>
               <div className="desc">
-                Traza líneas sobre medidas conocidas e indica su longitud real.
-                No hace falta que formen un rectángulo. Mínimo{" "}
-                <b>{MIN_CALIBRATION_LINES}</b>. <b>Clave:</b> repártelas por toda
-                la imagen, también <b>cerca de lo que vas a medir</b> — solo se
-                mide con fiabilidad dentro de la zona calibrada (recuadro verde).
+                Trace edges along <b>two perpendicular directions</b> on the flat
+                surface (e.g. the long and short edges of your objects). The app
+                uses them to recover the camera perspective. Make the lines{" "}
+                <b>long and spread across the image</b> — short lines close
+                together give poor results.
               </div>
 
-              <div className="row" style={{ marginTop: 10 }}>
+              <div className="mode-group" style={{ marginTop: 10 }}>
                 <button
-                  className={`btn ${mode === "addcalib" ? "active" : ""}`}
-                  onClick={() => toggleMode("addcalib")}
+                  className={`btn ${mode === "dir1" ? "active" : ""}`}
+                  style={{ borderColor: DIR1_COLOR }}
+                  onClick={() => toggleMode("dir1")}
                   disabled={!hasImage}
                 >
-                  {mode === "addcalib" ? "Trazando…" : "Añadir línea"}
+                  + Direction 1
+                </button>
+                <button
+                  className={`btn ${mode === "dir2" ? "active" : ""}`}
+                  style={{ borderColor: DIR2_COLOR }}
+                  onClick={() => toggleMode("dir2")}
+                  disabled={!hasImage}
+                >
+                  + Direction 2
                 </button>
                 <button
                   className="btn ghost"
                   onClick={resetCalibration}
                   disabled={calibLines.length === 0}
                 >
-                  Reiniciar
+                  Reset
                 </button>
               </div>
 
-              <div className="progress-text">
-                {calibrated
-                  ? `Calibrado con ${calibLines.length} líneas.`
-                  : `${calibLines.length}/${MIN_CALIBRATION_LINES} líneas — faltan ${linesLeft}.`}
+              <div className="status-grid">
+                <DirStatus
+                  label="Direction 1"
+                  color={DIR1_COLOR}
+                  lines={status.dir1Lines}
+                  hasLength={status.dir1HasLength}
+                />
+                <DirStatus
+                  label="Direction 2"
+                  color={DIR2_COLOR}
+                  lines={status.dir2Lines}
+                  hasLength={status.dir2HasLength}
+                />
+              </div>
+              <div className="hint" style={{ marginTop: 6 }}>
+                Need ≥{MIN_LINES_PER_DIRECTION} lines per direction and ≥1 known
+                length per direction.
               </div>
 
-              {mode === "addcalib" && (
+              {dirHint && (
                 <div className="hint" style={{ marginTop: 6 }}>
-                  {pending.length === 0 &&
-                    "Haz clic en el primer punto de una medida conocida."}
-                  {pending.length === 1 && "Haz clic en el segundo punto."}
-                  {pending.length === 2 && "Indica su longitud real:"}
+                  {dirHint}
                 </div>
               )}
 
-              {mode === "addcalib" && pending.length === 2 && (
-                <div className="row" style={{ marginTop: 8 }}>
-                  <label className="field">
-                    Longitud (mm)
-                    <input
-                      type="number"
-                      autoFocus
-                      value={pendingLen}
-                      onChange={(e) => setPendingLen(e.target.value)}
-                      onKeyDown={(e) =>
-                        e.key === "Enter" && confirmCalibLine()
-                      }
-                    />
-                  </label>
-                  <button
-                    className="btn primary stretch-end"
-                    onClick={confirmCalibLine}
-                  >
-                    Añadir
-                  </button>
-                  <button
-                    className="btn ghost stretch-end"
-                    onClick={cancelPending}
-                  >
-                    ✕
-                  </button>
-                </div>
-              )}
+              {(mode === "dir1" || mode === "dir2") &&
+                pending.length === 2 && (
+                  <div className="row" style={{ marginTop: 8 }}>
+                    <label className="field">
+                      Real length (mm) — optional
+                      <input
+                        type="number"
+                        autoFocus
+                        placeholder="e.g. 60"
+                        value={pendingLen}
+                        onChange={(e) => setPendingLen(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && confirmLine()}
+                      />
+                    </label>
+                    <button
+                      className="btn primary stretch-end"
+                      onClick={confirmLine}
+                    >
+                      Add
+                    </button>
+                    <button
+                      className="btn ghost stretch-end"
+                      onClick={cancelPending}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
 
               {calibLines.length > 0 && (
                 <div className="measure-list" style={{ marginTop: 10 }}>
-                  {calibLines.map((l, i) => (
+                  {calibLines.map((l) => (
                     <div className="measure-item" key={l.id}>
-                      <span>Línea {i + 1}</span>
-                      <span className="val" style={{ color: "#46c66a" }}>
-                        {l.length} mm
+                      <span style={{ color: l.dir === 1 ? DIR1_COLOR : DIR2_COLOR }}>
+                        Dir {l.dir}
+                      </span>
+                      <span className="val" style={{ color: "var(--muted)" }}>
+                        {l.length ? `${l.length} mm` : "no length"}
                       </span>
                       <button
                         onClick={() =>
                           setCalibLines((x) => x.filter((y) => y.id !== l.id))
                         }
-                        title="Eliminar"
+                        title="Delete"
                       >
                         ×
                       </button>
@@ -689,11 +674,10 @@ export default function Home() {
               {calib && (
                 <div style={{ marginTop: 10, display: "grid", gap: 4 }}>
                   <div className="metric">
-                    Error de calibración (RMS):{" "}
-                    <b>{calib.rmsError.toFixed(2)}%</b>
+                    Fit error (RMS): <b>{calib.rmsError.toFixed(2)}%</b>
                   </div>
                   <div className="metric">
-                    Error máximo: <b>{calib.maxError.toFixed(2)}%</b>
+                    Max fit error: <b>{calib.maxError.toFixed(2)}%</b>
                   </div>
                 </div>
               )}
@@ -706,31 +690,24 @@ export default function Home() {
           <div className={`step ${calibrated ? "active" : ""}`}>
             <div className="num">3</div>
             <div className="body">
-              <div className="title">Mide objetos</div>
+              <div className="title">Measure</div>
               <div className="desc">
-                Con la imagen calibrada, traza segmentos entre dos puntos.
+                Once calibrated, trace segments anywhere on the same flat plane.
               </div>
-              {anyExtrapolated && (
-                <div className="error-banner" style={{ marginTop: 10 }}>
-                  ⚠ Hay medidas <b>fuera de la zona calibrada</b> (en rojo). Ahí
-                  el resultado es poco fiable. Añade líneas de calibración cerca
-                  de esos objetos y vuelve a medir.
-                </div>
-              )}
               <div className="row" style={{ marginTop: 10 }}>
                 <button
                   className={`btn primary ${mode === "measure" ? "active" : ""}`}
                   onClick={() => toggleMode("measure")}
                   disabled={!calibrated}
                 >
-                  {mode === "measure" ? "Midiendo…" : "Medir"}
+                  {mode === "measure" ? "Measuring…" : "Measure"}
                 </button>
                 <button
                   className="btn ghost"
                   onClick={() => setMeasurements([])}
                   disabled={measurements.length === 0}
                 >
-                  Limpiar
+                  Clear
                 </button>
               </div>
 
@@ -738,7 +715,7 @@ export default function Home() {
                 <div className="measure-list" style={{ marginTop: 10 }}>
                   {measurements.map((m, i) => (
                     <div className="measure-item" key={m.id}>
-                      <span>Medida {i + 1}</span>
+                      <span>Measure {i + 1}</span>
                       <span className="val">
                         {calib
                           ? measureLength(calib.H, m.a, m.b).toFixed(1)
@@ -749,7 +726,7 @@ export default function Home() {
                         onClick={() =>
                           setMeasurements((x) => x.filter((y) => y.id !== m.id))
                         }
-                        title="Eliminar"
+                        title="Delete"
                       >
                         ×
                       </button>
@@ -762,9 +739,9 @@ export default function Home() {
         </div>
 
         <div className="hint">
-          <b>Controles:</b> clic = colocar punto · arrastrar un punto = moverlo ·
-          arrastrar la imagen = desplazar · rueda = zoom. Mide solo objetos en el
-          mismo plano que las referencias.
+          <b>Controls:</b> click = place point · drag a point = move it · drag
+          the image = pan · wheel = zoom. Only measure objects on the same flat
+          plane as the calibration lines.
         </div>
       </aside>
 
@@ -788,14 +765,39 @@ export default function Home() {
         {!hasImage && (
           <div className="empty-state">
             <div>
-              <div className="big">Pega o sube una imagen para empezar</div>
+              <div className="big">Paste or upload an image to start</div>
               <div>
-                <kbd>Ctrl/Cmd</kbd>+<kbd>V</kbd> para pegar desde el
-                portapapeles
+                <kbd>Ctrl/Cmd</kbd>+<kbd>V</kbd> to paste from the clipboard
               </div>
             </div>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function DirStatus({
+  label,
+  color,
+  lines,
+  hasLength,
+}: {
+  label: string;
+  color: string;
+  lines: number;
+  hasLength: boolean;
+}) {
+  const ok = lines >= MIN_LINES_PER_DIRECTION && hasLength;
+  return (
+    <div className="dir-status">
+      <span className="dot" style={{ background: color }} />
+      <div>
+        <div className="dir-name">{label}</div>
+        <div className={`dir-meta ${ok ? "ok" : ""}`}>
+          {lines} line{lines === 1 ? "" : "s"} ·{" "}
+          {hasLength ? "length ✓" : "need length"}
+        </div>
       </div>
     </div>
   );
@@ -810,8 +812,7 @@ function midpoint(a: Point, b: Point): Point {
 function drawHandle(
   ctx: CanvasRenderingContext2D,
   p: Point,
-  color: string,
-  label?: string
+  color: string
 ) {
   ctx.beginPath();
   ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
@@ -820,11 +821,6 @@ function drawHandle(
   ctx.lineWidth = 2;
   ctx.strokeStyle = "rgba(0,0,0,0.6)";
   ctx.stroke();
-  if (label) {
-    ctx.fillStyle = "#fff";
-    ctx.font = "bold 11px sans-serif";
-    ctx.fillText(label, p.x + 8, p.y - 8);
-  }
 }
 
 function drawSegment(

@@ -3,39 +3,52 @@
 Aplicación web (sin backend) para **medir el tamaño real de objetos en una foto**
 a partir de un objeto de referencia de dimensiones conocidas.
 
-Funciona corrigiendo la perspectiva del plano mediante una **homografía**: el
-usuario traza varias líneas sobre objetos de tamaño conocido e indica su
-longitud real. Con esas medidas se calibra todo el plano (mínimos cuadrados no
-lineales) y se puede medir cualquier otro objeto que esté **en el mismo plano**.
+It recovers the camera perspective using **vanishing points**: the user traces
+edges along two perpendicular real-world directions on the flat surface. Those
+lines determine the plane's **horizon** (line at infinity), which fixes the
+projective distortion across the whole image. Because the two directions are
+perpendicular, the plane is upgraded to a **metric** rectification, and one
+known length per direction sets the scale. The result is accurate measurement
+**everywhere on the plane**, even with an oblique camera — not just where the
+calibration marks are.
 
-## Uso
+## Usage
 
-1. **Carga una imagen**: pégala con `Ctrl/Cmd+V` desde el portapapeles o súbela.
-2. **Calibra**: pulsa "Añadir línea" y traza segmentos sobre medidas conocidas,
-   indicando la longitud real de cada uno. No hace falta que formen un
-   rectángulo. Hace falta un **mínimo de 6 líneas**; cuantas más y más variadas
-   (distintas orientaciones y zonas de la imagen), mayor precisión.
-3. **Mide**: traza segmentos entre dos puntos. La longitud real aparece en mm.
+1. **Load an image**: paste with `Ctrl/Cmd+V` or upload a file.
+2. **Calibrate**:
+   - `+ Direction 1`: trace ≥2 edges that are parallel in the real world (e.g.
+     the long edges of your objects).
+   - `+ Direction 2`: trace ≥2 edges along the perpendicular direction.
+   - Give at least one **known real length per direction**.
+   - Make the lines **long and spread across the image** — short lines close
+     together produce poor vanishing points and large errors.
+3. **Measure**: trace segments anywhere on the same plane; the real length (mm)
+   appears live.
 
-### Controles
+### Controls
 
-- **Clic**: colocar un punto (en modo añadir/medir).
-- **Arrastrar un punto**: moverlo (recalibra/recalcula en vivo).
-- **Arrastrar la imagen**: desplazarse (pan). También botón central o `Espacio`.
-- **Rueda**: zoom hacia el cursor.
-- Una **lupa** aparece al colocar puntos para precisión sub-píxel.
+- **Click**: place a point (snaps to existing points to continue lines).
+- **Drag a point**: move it (recalibrates/recomputes live).
+- **Drag the image**: pan. Middle button or `Space` also pan.
+- **Wheel**: zoom toward the cursor. A **magnifier loupe** aids sub-pixel aim.
 
-## Precisión y limitaciones
+## Accuracy
 
-- Precisión típica **±1–3%** con objetos coplanares, buena resolución y clics
-  cuidadosos. Puede degradarse a ±5–10% en bordes, ángulos extremos o con
-  distorsión de lente.
-- **Importante:** solo es válido para objetos en el **mismo plano** que la
-  referencia. Diferencias de altura introducen error por paralaje.
-- El indicador de "error de calibración" (RMS) muestra cómo de bien encaja el
-  modelo con las longitudes conocidas: úsalo como medida de fiabilidad.
+On synthetic oblique-camera tests with 2px clicking noise and calibration lines
+spread across the frame, full-image measurement error is **~0.3–1%** (median),
+including diagonals far from the calibration marks. Errors grow if the
+calibration lines for a direction are short and clustered together.
 
-## Desarrollo
+## Limitations
+
+- Valid only for objects on the **same flat plane** as the calibration lines.
+  Height differences introduce parallax error.
+- Lens distortion (especially phone wide-angle near image edges) is not
+  corrected and adds a few percent.
+- The "fit error" (RMS) shows how well the model matches the known lengths; it
+  is a useful but partial reliability indicator.
+
+## Development
 
 ```bash
 npm install
@@ -43,5 +56,5 @@ npm run dev      # http://localhost:3000
 npm run build
 ```
 
-Stack: Next.js 14 + TypeScript, renderizado en `<canvas>`, todo en cliente.
-La matemática de calibración está en `lib/homography.ts`.
+Stack: Next.js 14 + TypeScript, `<canvas>` rendering, fully client-side.
+The calibration math lives in `lib/homography.ts`.
