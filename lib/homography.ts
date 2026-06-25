@@ -1,29 +1,29 @@
-// Metric rectification of a plane from a single oblique photo.
+// Stratified metric rectification of a plane from a single oblique photo.
 //
-// The robust, photogrammetrically-correct way to measure on a plane seen at an
-// angle is to recover the plane<->image homography from VANISHING POINTS:
+// The user supplies two kinds of input, which are kept separate:
 //
-//   1. The user draws >=2 lines along one real-world direction (they are
-//      parallel in the world, e.g. the long edges of objects). Their image
-//      lines intersect at vanishing point vp1.
-//   2. >=2 lines along a second, perpendicular world direction -> vp2.
-//   3. The line through vp1 and vp2 is the image of the plane's line at
-//      infinity (the horizon). It determines the projective part of the
-//      distortion, so we can "remove perspective" anywhere in the image.
-//   4. Because the two directions are perpendicular in the world, we upgrade
-//      from affine to metric (orthonormal) rectification.
-//   5. Two known real lengths (one per direction) fix the scale in each axis,
-//      resolving the remaining aspect-ratio ambiguity.
+//   * PLANE LINES - segments drawn along straight features of the plane. Lines
+//     that are parallel in the real world meet at a vanishing point in the
+//     image. We auto-detect the families (no need to label directions, and they
+//     need NOT be perpendicular), get >=2 vanishing points, and the line
+//     through them is the plane's horizon (image of the line at infinity). That
+//     fixes the projective distortion everywhere -> "where the plane is".
 //
-// Vanishing points are estimated from lines spread across the WHOLE image, so
-// the perspective is captured globally and measurements are accurate everywhere
-// on the plane - not just where the calibration marks happen to be.
+//   * SCALE LINES - segments of known real length. After the horizon removes
+//     perspective, the plane is affine-rectified. A known length L of a segment
+//     with affine displacement d satisfies  d^T S d = L^2  for a symmetric 2x2
+//     matrix S (the metric). S is linear in its 3 entries, so >=3 scale lines in
+//     varied directions determine it by least squares. Cholesky of S gives the
+//     affine->metric upgrade. This sets "the size of the grid".
+//
+// Everything is done in Hartley-normalized image coordinates for stability.
 
 export type Point = { x: number; y: number };
 export type Matrix3 = number[]; // row-major length-9
 type V3 = [number, number, number];
 
-export const MIN_LINES_PER_DIRECTION = 2;
+export const MIN_PLANE_LINES = 4; // >=2 families x >=2 lines
+export const MIN_SCALE_LINES = 3;
 
 export function applyHomography(H: Matrix3, p: Point): Point {
   const x = H[0] * p.x + H[1] * p.y + H[2];
@@ -50,6 +50,14 @@ function cross(a: V3, b: V3): V3 {
   ];
 }
 
+function det3(a: V3, b: V3, c: V3): number {
+  return (
+    a[0] * (b[1] * c[2] - b[2] * c[1]) -
+    a[1] * (b[0] * c[2] - b[2] * c[0]) +
+    a[2] * (b[0] * c[1] - b[1] * c[0])
+  );
+}
+
 function matMul3(A: Matrix3, B: Matrix3): Matrix3 {
   const C = new Array(9).fill(0);
   for (let r = 0; r < 3; r++)
@@ -58,13 +66,12 @@ function matMul3(A: Matrix3, B: Matrix3): Matrix3 {
   return C;
 }
 
-function lineOf(p: Point, q: Point): V3 {
-  return cross([p.x, p.y, 1], [q.x, q.y, 1]);
+function normalize3(v: V3): V3 {
+  const n = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / n, v[1] / n, v[2] / n];
 }
 
-// Jacobi eigendecomposition of a symmetric 3x3 matrix (row-major). Returns
-// eigenvalues and their eigenvectors (as V3 columns). Robust and exact enough
-// for our needs, with no conditioning issues.
+// Jacobi eigendecomposition of a symmetric 3x3 (row-major).
 function symEig3(M: number[]): { val: number[]; vec: V3[] } {
   const a = [
     [M[0], M[1], M[2]],
@@ -92,7 +99,6 @@ function symEig3(M: number[]): { val: number[]; vec: V3[] } {
         (Math.abs(theta) + Math.sqrt(theta * theta + 1));
       const c = 1 / Math.sqrt(t * t + 1);
       const s = t * c;
-      // Rotate rows/cols p,q of A.
       a[p][p] -= t * apq;
       a[q][q] += t * apq;
       a[p][q] = a[q][p] = 0;
@@ -103,7 +109,6 @@ function symEig3(M: number[]): { val: number[]; vec: V3[] } {
         a[k][p] = a[p][k] = c * akp - s * akq;
         a[k][q] = a[q][k] = s * akp + c * akq;
       }
-      // Accumulate eigenvectors.
       for (let k = 0; k < 3; k++) {
         const vkp = v[k][p];
         const vkq = v[k][q];
@@ -122,22 +127,7 @@ function symEig3(M: number[]): { val: number[]; vec: V3[] } {
   };
 }
 
-// Least-squares vanishing point: the point v minimizing sum (l_k . v)^2 over
-// the (normalized) image lines l_k. That is the eigenvector of the smallest
-// eigenvalue of M = sum l_k l_k^T.
-function vanishingPoint(lines: { a: Point; b: Point }[]): V3 | null {
-  const M = [0, 0, 0, 0, 0, 0, 0, 0, 0];
-  let used = 0;
-  for (const seg of lines) {
-    let l = lineOf(seg.a, seg.b);
-    const n = Math.hypot(l[0], l[1]);
-    if (n < 1e-9) continue;
-    l = [l[0] / n, l[1] / n, l[2] / n];
-    for (let i = 0; i < 3; i++)
-      for (let j = 0; j < 3; j++) M[i * 3 + j] += l[i] * l[j];
-    used++;
-  }
-  if (used < 2) return null;
+function smallestEigvec(M: number[]): V3 {
   const { val, vec } = symEig3(M);
   let mi = 0;
   if (val[1] < val[mi]) mi = 1;
@@ -145,62 +135,61 @@ function vanishingPoint(lines: { a: Point; b: Point }[]): V3 | null {
   return vec[mi];
 }
 
-function invert2x2(m: [number, number, number, number]): number[] | null {
-  const [a, b, c, d] = m;
-  const det = a * d - b * c;
-  if (Math.abs(det) < 1e-12) return null;
-  return [d / det, -b / det, -c / det, a / det];
+// Best-fit vanishing point of a set of lines: smallest eigenvector of sum l l^T.
+function vanishingOf(lines: V3[]): V3 {
+  const M = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (const l of lines)
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++) M[i * 3 + j] += l[i] * l[j];
+  return smallestEigvec(M);
 }
 
-// --- calibration ------------------------------------------------------------
+function solveLinearSystem(A: number[][], b: number[]): number[] | null {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < n; r++)
+      if (Math.abs(M[r][col]) > Math.abs(M[pivot][col])) pivot = r;
+    if (Math.abs(M[pivot][col]) < 1e-15) return null;
+    [M[col], M[pivot]] = [M[pivot], M[col]];
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const f = M[r][col] / M[col][col];
+      if (f === 0) continue;
+      for (let c = col; c <= n; c++) M[r][c] -= f * M[col][c];
+    }
+  }
+  return M.map((row, i) => row[n] / row[i]);
+}
 
-export type CalibLine = {
-  a: Point;
-  b: Point;
-  dir: 1 | 2; // which real-world direction this line is parallel to
-  length?: number; // known real length (mm), optional
-};
+// --- types ------------------------------------------------------------------
+
+export type PlaneLine = { a: Point; b: Point };
+export type ScaleLine = { a: Point; b: Point; length: number };
 
 export type CalibrationResult = {
   H: Matrix3; // image -> world (mm)
-  rmsError: number; // RMS relative error (%) over known-length lines
+  rmsError: number;
   maxError: number;
-  horizon: V3; // image of the plane's line at infinity (for visualization)
+  vanishingPoints: number; // how many families were detected
+  horizon: V3; // image-space line, for visualization
 };
 
 export type CalibrationStatus = {
-  dir1Lines: number;
-  dir2Lines: number;
-  dir1HasLength: boolean;
-  dir2HasLength: boolean;
+  planeLines: number;
+  vanishingPoints: number;
+  scaleLines: number;
   ready: boolean;
+  reason?: string;
 };
 
-export function calibrationStatus(lines: CalibLine[]): CalibrationStatus {
-  const d1 = lines.filter((l) => l.dir === 1);
-  const d2 = lines.filter((l) => l.dir === 2);
-  const dir1HasLength = d1.some((l) => (l.length ?? 0) > 0);
-  const dir2HasLength = d2.some((l) => (l.length ?? 0) > 0);
-  return {
-    dir1Lines: d1.length,
-    dir2Lines: d2.length,
-    dir1HasLength,
-    dir2HasLength,
-    ready:
-      d1.length >= MIN_LINES_PER_DIRECTION &&
-      d2.length >= MIN_LINES_PER_DIRECTION &&
-      dir1HasLength &&
-      dir2HasLength,
-  };
-}
+// --- Hartley normalization --------------------------------------------------
 
-export function calibrate(lines: CalibLine[]): CalibrationResult | null {
-  const status = calibrationStatus(lines);
-  if (!status.ready) return null;
-
-  // Hartley-normalize image coordinates for numerical stability, then do all of
-  // the construction in normalized space and compose the normalization back in.
-  const pts: Point[] = lines.flatMap((l) => [l.a, l.b]);
+function normalization(pts: Point[]): {
+  T: Matrix3;
+  apply: (p: Point) => Point;
+} | null {
   let cx = 0;
   let cy = 0;
   for (const p of pts) {
@@ -213,92 +202,188 @@ export function calibrate(lines: CalibLine[]): CalibrationResult | null {
   for (const p of pts) md += Math.hypot(p.x - cx, p.y - cy);
   md /= pts.length;
   if (md < 1e-9) return null;
-  const s0 = Math.SQRT2 / md;
-  const T: Matrix3 = [s0, 0, -s0 * cx, 0, s0, -s0 * cy, 0, 0, 1];
-  const nrm = (p: Point): Point => ({
-    x: s0 * (p.x - cx),
-    y: s0 * (p.y - cy),
-  });
-  const nLines: CalibLine[] = lines.map((l) => ({
-    a: nrm(l.a),
-    b: nrm(l.b),
-    dir: l.dir,
-    length: l.length,
-  }));
+  const s = Math.SQRT2 / md;
+  return {
+    T: [s, 0, -s * cx, 0, s, -s * cy, 0, 0, 1],
+    apply: (p: Point) => ({ x: s * (p.x - cx), y: s * (p.y - cy) }),
+  };
+}
 
-  const d1 = nLines.filter((l) => l.dir === 1);
-  const d2 = nLines.filter((l) => l.dir === 2);
+// --- vanishing-point families + horizon -------------------------------------
 
-  const vp1 = vanishingPoint(d1);
-  const vp2 = vanishingPoint(d2);
-  if (!vp1 || !vp2) return null;
+// Greedy consensus: repeatedly find the largest set of mutually-concurrent
+// lines, take its vanishing point, remove it, repeat. Lines must already be in
+// normalized coordinates. Returns vanishing points (homogeneous, normalized).
+function detectVanishingPoints(linesN: V3[]): V3[] {
+  const CONCURRENCY_T = 0.02; // |det| of three unit line vectors
+  const remaining = linesN.map((_, i) => i);
+  const vps: V3[] = [];
+  const unit = linesN.map(normalize3);
 
-  // Horizon (image of the line at infinity).
-  const horizon = cross(vp1, vp2);
-
-  // Projective rectification: send the horizon to infinity.
-  const Hp: Matrix3 = [1, 0, 0, 0, 1, 0, horizon[0], horizon[1], horizon[2]];
-
-  // After Hp the vanishing points become pure directions d1,d2 (their image
-  // is [vp_x, vp_y, 0] because horizon . vp = 0). Normalize them.
-  const dir1: [number, number] = [vp1[0], vp1[1]];
-  const dir2: [number, number] = [vp2[0], vp2[1]];
-  const n1 = Math.hypot(dir1[0], dir1[1]);
-  const n2 = Math.hypot(dir2[0], dir2[1]);
-  if (n1 < 1e-12 || n2 < 1e-12) return null;
-  const u1: [number, number] = [dir1[0] / n1, dir1[1] / n1];
-  const u2: [number, number] = [dir2[0] / n2, dir2[1] / n2];
-
-  // Metric upgrade: map direction 1 -> x-axis and direction 2 -> y-axis, which
-  // makes the (perpendicular) world directions orthonormal in the rectified
-  // frame. A = inv([u1 u2]).
-  const A = invert2x2([u1[0], u2[0], u1[1], u2[1]]);
-  if (!A) return null; // directions collinear -> not two distinct directions
-  const embedA: Matrix3 = [A[0], A[1], 0, A[2], A[3], 0, 0, 0, 1];
-
-  // H0 maps image -> orthonormal-rectified plane (unknown per-axis scale).
-  const H0 = matMul3(embedA, Hp);
-
-  // Scales from known lengths: dir-1 lines lie along x after H0, dir-2 along y.
-  const scaleFrom = (segs: CalibLine[]) => {
-    let sum = 0;
-    let n = 0;
-    for (const s of segs) {
-      if (!(s.length! > 0)) continue;
-      const rect = dist(applyHomography(H0, s.a), applyHomography(H0, s.b));
-      if (rect > 1e-9) {
-        sum += s.length! / rect;
-        n++;
+  while (remaining.length >= 2 && vps.length < 6) {
+    let bestSet: number[] = [];
+    for (let ii = 0; ii < remaining.length; ii++) {
+      for (let jj = ii + 1; jj < remaining.length; jj++) {
+        const i = remaining[ii];
+        const j = remaining[jj];
+        const set = [i, j];
+        for (const k of remaining) {
+          if (k === i || k === j) continue;
+          if (Math.abs(det3(unit[i], unit[j], unit[k])) < CONCURRENCY_T)
+            set.push(k);
+        }
+        if (set.length > bestSet.length) bestSet = set;
       }
     }
-    return n ? sum / n : null;
+    if (bestSet.length < 2) break;
+    vps.push(normalize3(vanishingOf(bestSet.map((i) => linesN[i]))));
+    const inSet = new Set(bestSet);
+    for (let r = remaining.length - 1; r >= 0; r--)
+      if (inSet.has(remaining[r])) remaining.splice(r, 1);
+  }
+  return vps;
+}
+
+function lineOfN(a: Point, b: Point): V3 {
+  return cross([a.x, a.y, 1], [b.x, b.y, 1]);
+}
+
+// --- status -----------------------------------------------------------------
+
+export function calibrationStatus(
+  planeLines: PlaneLine[],
+  scaleLines: ScaleLine[]
+): CalibrationStatus {
+  const base: CalibrationStatus = {
+    planeLines: planeLines.length,
+    vanishingPoints: 0,
+    scaleLines: scaleLines.length,
+    ready: false,
   };
-  const sx = scaleFrom(d1);
-  const sy = scaleFrom(d2);
-  if (sx == null || sy == null) return null;
+  if (planeLines.length < 2) {
+    base.reason = "Draw plane lines along straight edges of the surface.";
+    return base;
+  }
+  const norm = normalization(planeLines.flatMap((l) => [l.a, l.b]));
+  if (!norm) return base;
+  const linesN = planeLines.map((l) =>
+    lineOfN(norm.apply(l.a), norm.apply(l.b))
+  );
+  const vps = detectVanishingPoints(linesN);
+  base.vanishingPoints = vps.length;
+  if (vps.length < 2) {
+    base.reason =
+      "Need at least two sets of parallel plane lines (in different directions).";
+    return base;
+  }
+  if (scaleLines.length < MIN_SCALE_LINES) {
+    base.reason = `Add at least ${MIN_SCALE_LINES} known-length lines, in varied directions.`;
+    return base;
+  }
+  base.ready = true;
+  return base;
+}
 
-  const S: Matrix3 = [sx, 0, 0, 0, sy, 0, 0, 0, 1];
-  // H0 and S work in normalized image space; compose normalization back so H
-  // maps ORIGINAL image pixels -> world (mm).
-  const H = matMul3(matMul3(S, H0), T);
+// --- calibration ------------------------------------------------------------
 
-  // Sanity: reject degenerate/non-finite results.
+export function calibrate(
+  planeLines: PlaneLine[],
+  scaleLines: ScaleLine[]
+): CalibrationResult | null {
+  if (planeLines.length < 2 || scaleLines.length < MIN_SCALE_LINES) return null;
+
+  const allPts = [
+    ...planeLines.flatMap((l) => [l.a, l.b]),
+    ...scaleLines.flatMap((l) => [l.a, l.b]),
+  ];
+  const norm = normalization(allPts);
+  if (!norm) return null;
+
+  // Horizon from plane-line vanishing points (in normalized space).
+  const linesN = planeLines.map((l) =>
+    lineOfN(norm.apply(l.a), norm.apply(l.b))
+  );
+  const vps = detectVanishingPoints(linesN);
+  if (vps.length < 2) return null;
+  // Fit the horizon as the line minimizing sum (l . vp)^2 over vanishing points.
+  const Mh = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (const vp of vps)
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++) Mh[i * 3 + j] += vp[i] * vp[j];
+  const horizon = smallestEigvec(Mh);
+
+  // Projective rectification (normalized image -> affine).
+  const Hp: Matrix3 = [1, 0, 0, 0, 1, 0, horizon[0], horizon[1], horizon[2]];
+
+  // Fit the metric S from known lengths: row [dx^2, 2 dx dy, dy^2] . S = L^2.
+  const A: number[][] = [];
+  const rhs: number[] = [];
+  for (const s of scaleLines) {
+    if (!(s.length > 0)) continue;
+    const pa = applyHomography(Hp, norm.apply(s.a));
+    const pb = applyHomography(Hp, norm.apply(s.b));
+    const dx = pa.x - pb.x;
+    const dy = pa.y - pb.y;
+    A.push([dx * dx, 2 * dx * dy, dy * dy]);
+    rhs.push(s.length * s.length);
+  }
+  if (A.length < 3) return null;
+
+  // Normal equations (A^T A) s = A^T b (least squares).
+  const AtA = [
+    [0, 0, 0],
+    [0, 0, 0],
+    [0, 0, 0],
+  ];
+  const Atb = [0, 0, 0];
+  for (let r = 0; r < A.length; r++) {
+    for (let i = 0; i < 3; i++) {
+      Atb[i] += A[r][i] * rhs[r];
+      for (let j = 0; j < 3; j++) AtA[i][j] += A[r][i] * A[r][j];
+    }
+  }
+  // Reject if the scale-line directions are not varied enough to pin all three
+  // entries of S (e.g. all lengths lie along only two directions): the normal
+  // matrix becomes rank-deficient and the metric would be arbitrary.
+  const eig = symEig3(AtA.flat());
+  const maxEv = Math.max(...eig.val.map(Math.abs));
+  const minEv = Math.min(...eig.val.map(Math.abs));
+  if (maxEv < 1e-12 || minEv / maxEv < 1e-4) return null;
+
+  const Svec = solveLinearSystem(AtA, Atb);
+  if (!Svec) return null;
+  const [S11, S12, S22] = Svec;
+
+  // S must be positive definite to be a valid metric.
+  if (!(S11 > 0) || !(S11 * S22 - S12 * S12 > 0)) return null;
+
+  // Cholesky-style upper factor M with M^T M = S (affine -> metric).
+  const L11 = Math.sqrt(S11);
+  const L12 = S12 / L11;
+  const L22sq = S22 - L12 * L12;
+  if (!(L22sq > 0)) return null;
+  const L22 = Math.sqrt(L22sq);
+  const embedM: Matrix3 = [L11, L12, 0, 0, L22, 0, 0, 0, 1];
+
+  // Compose: image -> world(mm).
+  const H = matMul3(matMul3(embedM, Hp), norm.T);
   if (H.some((x) => !Number.isFinite(x))) return null;
 
-  // Error metrics over all known-length lines.
+  // Error metrics over known-length lines.
   let sumSq = 0;
   let max = 0;
   let count = 0;
-  for (const l of lines) {
-    if (!(l.length! > 0)) continue;
-    const m = measureLength(H, l.a, l.b);
-    const rel = Math.abs(m - l.length!) / l.length!;
+  for (const s of scaleLines) {
+    if (!(s.length > 0)) continue;
+    const m = measureLength(H, s.a, s.b);
+    const rel = Math.abs(m - s.length) / s.length;
     sumSq += rel * rel;
     if (rel > max) max = rel;
     count++;
   }
 
-  // Transform the horizon line back to original image space (l_img = T^T l).
+  // Horizon back to image space (l_img = T^T l).
+  const T = norm.T;
   const horizonImg: V3 = [
     T[0] * horizon[0] + T[3] * horizon[1] + T[6] * horizon[2],
     T[1] * horizon[0] + T[4] * horizon[1] + T[7] * horizon[2],
@@ -309,6 +394,7 @@ export function calibrate(lines: CalibLine[]): CalibrationResult | null {
     H,
     rmsError: count ? Math.sqrt(sumSq / count) * 100 : 0,
     maxError: max * 100,
+    vanishingPoints: vps.length,
     horizon: horizonImg,
   };
 }

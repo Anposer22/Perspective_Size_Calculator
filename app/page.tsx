@@ -5,25 +5,28 @@ import {
   calibrate,
   calibrationStatus,
   measureLength,
-  MIN_LINES_PER_DIRECTION,
+  MIN_SCALE_LINES,
   type CalibrationResult,
-  type CalibLine,
+  type PlaneLine as PlaneLineT,
+  type ScaleLine as ScaleLineT,
   type Point,
 } from "@/lib/homography";
 
-type Mode = "idle" | "dir1" | "dir2" | "measure";
+type Mode = "idle" | "plane" | "scale" | "measure";
 
-type Line = { id: number; a: Point; b: Point; dir: 1 | 2; length?: number };
+type PlaneLine = { id: number; a: Point; b: Point };
+type ScaleLine = { id: number; a: Point; b: Point; length: number };
 type Measurement = { id: number; a: Point; b: Point };
 
 type DragRef =
-  | { type: "calib"; id: number; end: "a" | "b" }
+  | { type: "plane"; id: number; end: "a" | "b" }
+  | { type: "scale"; id: number; end: "a" | "b" }
   | { type: "measure"; id: number; end: "a" | "b" }
   | { type: "pending"; index: number };
 
 const HANDLE_HIT_RADIUS = 10;
-const DIR1_COLOR = "#4da3ff";
-const DIR2_COLOR = "#c77dff";
+const PLANE_COLOR = "#4da3ff";
+const SCALE_COLOR = "#46c66a";
 const MEAS_COLOR = "#ff8a3d";
 
 export default function Home() {
@@ -36,7 +39,8 @@ export default function Home() {
 
   const viewRef = useRef({ scale: 1, offsetX: 0, offsetY: 0 });
 
-  const [calibLines, setCalibLines] = useState<Line[]>([]);
+  const [planeLines, setPlaneLines] = useState<PlaneLine[]>([]);
+  const [scaleLines, setScaleLines] = useState<ScaleLine[]>([]);
   const [measurements, setMeasurements] = useState<Measurement[]>([]);
   const [pending, setPending] = useState<Point[]>([]);
   const [pendingLen, setPendingLen] = useState<string>("");
@@ -51,10 +55,24 @@ export default function Home() {
   } | null>(null);
   const idRef = useRef(1);
 
-  const stateRef = useRef({ mode, calibLines, measurements, pending, hasImage });
+  const stateRef = useRef({
+    mode,
+    planeLines,
+    scaleLines,
+    measurements,
+    pending,
+    hasImage,
+  });
   useEffect(() => {
-    stateRef.current = { mode, calibLines, measurements, pending, hasImage };
-  }, [mode, calibLines, measurements, pending, hasImage]);
+    stateRef.current = {
+      mode,
+      planeLines,
+      scaleLines,
+      measurements,
+      pending,
+      hasImage,
+    };
+  }, [mode, planeLines, scaleLines, measurements, pending, hasImage]);
 
   // ---- Image loading -------------------------------------------------------
 
@@ -80,12 +98,13 @@ export default function Home() {
         imgRef.current = img;
         setHasImage(true);
         setError(null);
-        setCalibLines([]);
+        setPlaneLines([]);
+        setScaleLines([]);
         setMeasurements([]);
         setPending([]);
         setPendingLen("");
         setCalib(null);
-        setMode("dir1");
+        setMode("plane");
         fitImage();
         URL.revokeObjectURL(url);
       };
@@ -134,32 +153,32 @@ export default function Home() {
   // ---- Calibration recompute ----------------------------------------------
 
   useEffect(() => {
-    const lines: CalibLine[] = calibLines.map((l) => ({
+    const pl: PlaneLineT[] = planeLines.map((l) => ({ a: l.a, b: l.b }));
+    const sl: ScaleLineT[] = scaleLines.map((l) => ({
       a: l.a,
       b: l.b,
-      dir: l.dir,
       length: l.length,
     }));
-    if (!calibrationStatus(lines).ready) {
+    if (!calibrationStatus(pl, sl).ready) {
       setCalib(null);
       return;
     }
-    const result = calibrate(lines);
+    const result = calibrate(pl, sl);
     if (!result) {
       setCalib(null);
       setError(
-        "Calibration failed. Make sure the two directions are clearly different and the lines are not collinear."
+        "Calibration failed. Add known-length lines in more varied directions (e.g. a diagonal), and make sure your plane lines form at least two clear directions."
       );
     } else {
       setError(null);
       setCalib(result);
     }
-  }, [calibLines]);
+  }, [planeLines, scaleLines]);
 
   // ---- Hit testing & dragging ----------------------------------------------
 
   const hitTestHandle = (screen: Point): DragRef | null => {
-    const { calibLines, measurements, pending } = stateRef.current;
+    const { planeLines, scaleLines, measurements, pending } = stateRef.current;
     const r2 = HANDLE_HIT_RADIUS * HANDLE_HIT_RADIUS;
     const near = (p: Point) => {
       const s = imageToScreen(p);
@@ -175,20 +194,30 @@ export default function Home() {
       if (near(measurements[i].a))
         return { type: "measure", id: measurements[i].id, end: "a" };
     }
-    for (let i = calibLines.length - 1; i >= 0; i--) {
-      if (near(calibLines[i].b))
-        return { type: "calib", id: calibLines[i].id, end: "b" };
-      if (near(calibLines[i].a))
-        return { type: "calib", id: calibLines[i].id, end: "a" };
+    for (let i = scaleLines.length - 1; i >= 0; i--) {
+      if (near(scaleLines[i].b))
+        return { type: "scale", id: scaleLines[i].id, end: "b" };
+      if (near(scaleLines[i].a))
+        return { type: "scale", id: scaleLines[i].id, end: "a" };
+    }
+    for (let i = planeLines.length - 1; i >= 0; i--) {
+      if (near(planeLines[i].b))
+        return { type: "plane", id: planeLines[i].id, end: "b" };
+      if (near(planeLines[i].a))
+        return { type: "plane", id: planeLines[i].id, end: "a" };
     }
     return null;
   };
 
   const refToPoint = (ref: DragRef): Point | null => {
-    const { calibLines, measurements, pending } = stateRef.current;
+    const { planeLines, scaleLines, measurements, pending } = stateRef.current;
     if (ref.type === "pending") return pending[ref.index] ?? null;
-    if (ref.type === "calib") {
-      const l = calibLines.find((x) => x.id === ref.id);
+    if (ref.type === "plane") {
+      const l = planeLines.find((x) => x.id === ref.id);
+      return l ? l[ref.end] : null;
+    }
+    if (ref.type === "scale") {
+      const l = scaleLines.find((x) => x.id === ref.id);
       return l ? l[ref.end] : null;
     }
     const m = measurements.find((x) => x.id === ref.id);
@@ -198,8 +227,12 @@ export default function Home() {
   const moveHandle = (ref: DragRef, img: Point) => {
     if (ref.type === "pending")
       setPending((prev) => prev.map((p, i) => (i === ref.index ? img : p)));
-    else if (ref.type === "calib")
-      setCalibLines((prev) =>
+    else if (ref.type === "plane")
+      setPlaneLines((prev) =>
+        prev.map((l) => (l.id === ref.id ? { ...l, [ref.end]: img } : l))
+      );
+    else if (ref.type === "scale")
+      setScaleLines((prev) =>
         prev.map((l) => (l.id === ref.id ? { ...l, [ref.end]: img } : l))
       );
     else
@@ -223,6 +256,12 @@ export default function Home() {
   useEffect(() => {
     const kd = (e: KeyboardEvent) => {
       if (e.code === "Space") spaceDown.current = true;
+      if (e.code === "Escape") {
+        // Cancel an in-progress line.
+        setPending([]);
+        setPendingLen("");
+        draw();
+      }
     };
     const ku = (e: KeyboardEvent) => {
       if (e.code === "Space") spaceDown.current = false;
@@ -233,6 +272,7 @@ export default function Home() {
       window.removeEventListener("keydown", kd);
       window.removeEventListener("keyup", ku);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const getLocal = (e: React.PointerEvent): Point => {
@@ -330,33 +370,36 @@ export default function Home() {
   const placePoint = (p: Point) => {
     const m = stateRef.current.mode;
     if (m === "idle") return;
-    if (m !== "measure" && stateRef.current.pending.length >= 2) return;
+    if (m === "scale" && stateRef.current.pending.length >= 2) return;
     setPending((prev) => {
       const next = [...prev, p];
-      if (next.length === 2 && m === "measure") {
-        setMeasurements((arr) => [
-          ...arr,
-          { id: idRef.current++, a: next[0], b: next[1] },
-        ]);
-        return [];
+      if (next.length === 2) {
+        if (m === "plane") {
+          setPlaneLines((arr) => [
+            ...arr,
+            { id: idRef.current++, a: next[0], b: next[1] },
+          ]);
+          return [];
+        }
+        if (m === "measure") {
+          setMeasurements((arr) => [
+            ...arr,
+            { id: idRef.current++, a: next[0], b: next[1] },
+          ]);
+          return [];
+        }
+        // scale: hold until length is confirmed.
       }
       return next;
     });
   };
 
-  const confirmLine = () => {
-    const m = stateRef.current.mode;
-    if (pending.length !== 2 || (m !== "dir1" && m !== "dir2")) return;
+  const confirmScaleLine = () => {
     const len = parseFloat(pendingLen);
-    setCalibLines((prev) => [
+    if (pending.length !== 2 || !(len > 0)) return;
+    setScaleLines((prev) => [
       ...prev,
-      {
-        id: idRef.current++,
-        a: pending[0],
-        b: pending[1],
-        dir: m === "dir1" ? 1 : 2,
-        length: len > 0 ? len : undefined,
-      },
+      { id: idRef.current++, a: pending[0], b: pending[1], length: len },
     ]);
     setPending([]);
     setPendingLen("");
@@ -398,19 +441,27 @@ export default function Home() {
       img.height * v.scale
     );
 
-    // Calibration lines, colored by direction.
-    calibLines.forEach((l) => {
-      const color = l.dir === 1 ? DIR1_COLOR : DIR2_COLOR;
+    // Plane lines (blue), extended faintly to suggest the direction.
+    planeLines.forEach((l) => {
       const a = imageToScreen(l.a);
       const b = imageToScreen(l.b);
-      drawSegment(ctx, a, b, color);
-      drawHandle(ctx, a, color);
-      drawHandle(ctx, b, color);
-      const tag = l.length ? `${l.length} mm` : `Dir ${l.dir}`;
-      drawLabel(ctx, midpoint(a, b), tag, color);
+      drawExtendedLine(ctx, a, b, cw, ch, "rgba(77,163,255,0.25)");
+      drawSegment(ctx, a, b, PLANE_COLOR);
+      drawHandle(ctx, a, PLANE_COLOR);
+      drawHandle(ctx, b, PLANE_COLOR);
     });
 
-    // Measurements.
+    // Scale lines (green) with their known length.
+    scaleLines.forEach((l) => {
+      const a = imageToScreen(l.a);
+      const b = imageToScreen(l.b);
+      drawSegment(ctx, a, b, SCALE_COLOR);
+      drawHandle(ctx, a, SCALE_COLOR);
+      drawHandle(ctx, b, SCALE_COLOR);
+      drawLabel(ctx, midpoint(a, b), `${l.length} mm`, SCALE_COLOR);
+    });
+
+    // Measurements (orange).
     measurements.forEach((m) => {
       const a = imageToScreen(m.a);
       const b = imageToScreen(m.b);
@@ -423,27 +474,30 @@ export default function Home() {
       }
     });
 
-    // Pending points + full-screen guide line.
+    // Pending line + full-screen guide.
     const cur = cursorRef.current;
     const penColor =
-      mode === "dir1" ? DIR1_COLOR : mode === "dir2" ? DIR2_COLOR : "#ffffff";
+      mode === "plane"
+        ? PLANE_COLOR
+        : mode === "scale"
+        ? SCALE_COLOR
+        : MEAS_COLOR;
     if (pending.length === 1) {
       const a = imageToScreen(pending[0]);
       drawHandle(ctx, a, penColor);
       if (cur) {
-        drawExtendedLine(ctx, a, cur.screen, cw, ch);
+        drawExtendedLine(ctx, a, cur.screen, cw, ch, "rgba(255,255,255,0.5)");
         drawSegment(ctx, a, cur.screen, penColor);
       }
     } else if (pending.length === 2) {
       const a = imageToScreen(pending[0]);
       const b = imageToScreen(pending[1]);
-      drawExtendedLine(ctx, a, b, cw, ch);
+      drawExtendedLine(ctx, a, b, cw, ch, "rgba(255,255,255,0.5)");
       drawSegment(ctx, a, b, penColor);
       drawHandle(ctx, a, penColor);
       drawHandle(ctx, b, penColor);
     }
 
-    // Snap ring.
     if (cur?.snap && gestureRef.current?.decided !== "movehandle") {
       ctx.beginPath();
       ctx.arc(cur.snap.x, cur.snap.y, 9, 0, Math.PI * 2);
@@ -452,13 +506,12 @@ export default function Home() {
       ctx.stroke();
     }
 
-    // Crosshair + loupe while placing points.
     const placing = mode !== "idle";
     if (cur && placing && gestureRef.current?.decided !== "movehandle") {
       drawCrosshair(ctx, cur.screen, cw, ch);
       drawLoupe(ctx, img, v, cur, cw, ch);
     }
-  }, [calibLines, measurements, pending, calib, mode]);
+  }, [planeLines, scaleLines, measurements, pending, calib, mode]);
 
   useEffect(() => {
     draw();
@@ -475,7 +528,8 @@ export default function Home() {
   // ---- Derived UI ----------------------------------------------------------
 
   const status = calibrationStatus(
-    calibLines.map((l) => ({ a: l.a, b: l.b, dir: l.dir, length: l.length }))
+    planeLines.map((l) => ({ a: l.a, b: l.b })),
+    scaleLines.map((l) => ({ a: l.a, b: l.b, length: l.length }))
   );
   const calibrated = !!calib;
 
@@ -485,20 +539,19 @@ export default function Home() {
     setMode((cur) => (cur === m ? "idle" : m));
   };
 
-  const resetCalibration = () => {
-    setCalibLines([]);
-    setPending([]);
-    setPendingLen("");
-    setCalib(null);
-  };
-
-  const dirHint =
-    mode === "dir1" || mode === "dir2"
+  const planeHint =
+    mode === "plane"
       ? pending.length === 0
-        ? "Click the first point of an edge along this direction."
+        ? "Click the first point of an edge that runs along the plane."
+        : "Click the second point. (Esc cancels.)"
+      : "";
+  const scaleHint =
+    mode === "scale"
+      ? pending.length === 0
+        ? "Click the first point of a segment whose real length you know."
         : pending.length === 1
-        ? "Click the second point."
-        : "Optionally enter its real length, then add the line."
+        ? "Click the second point. (Esc cancels.)"
+        : "Enter its real length, then add."
       : "";
 
   // -------------------------------------------------------------------------
@@ -550,117 +603,151 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Step 2: calibration via vanishing points */}
+        {/* Step 2: fix the plane */}
         <div className="card">
           <div
             className={`step ${
-              calibrated ? "done" : calibLines.length > 0 ? "active" : ""
+              status.vanishingPoints >= 2
+                ? "done"
+                : planeLines.length > 0
+                ? "active"
+                : ""
             }`}
           >
             <div className="num">2</div>
             <div className="body">
-              <div className="title">Calibrate the plane</div>
+              <div className="title">Fix the plane</div>
               <div className="desc">
-                Trace edges along <b>two perpendicular directions</b> on the flat
-                surface (e.g. the long and short edges of your objects). The app
-                uses them to recover the camera perspective. Make the lines{" "}
-                <b>long and spread across the image</b> — short lines close
-                together give poor results.
+                Trace lines along <b>straight edges of the surface</b>. Lines
+                that are parallel in real life are detected automatically — give{" "}
+                <b>at least two different directions</b> (they need not be
+                perpendicular). Longer, well-separated lines work best.
               </div>
-
-              <div className="mode-group" style={{ marginTop: 10 }}>
+              <div className="row" style={{ marginTop: 10 }}>
                 <button
-                  className={`btn ${mode === "dir1" ? "active" : ""}`}
-                  style={{ borderColor: DIR1_COLOR }}
-                  onClick={() => toggleMode("dir1")}
+                  className={`btn ${mode === "plane" ? "active" : ""}`}
+                  style={{ borderColor: PLANE_COLOR }}
+                  onClick={() => toggleMode("plane")}
                   disabled={!hasImage}
                 >
-                  + Direction 1
-                </button>
-                <button
-                  className={`btn ${mode === "dir2" ? "active" : ""}`}
-                  style={{ borderColor: DIR2_COLOR }}
-                  onClick={() => toggleMode("dir2")}
-                  disabled={!hasImage}
-                >
-                  + Direction 2
+                  {mode === "plane" ? "Tracing…" : "+ Plane line"}
                 </button>
                 <button
                   className="btn ghost"
-                  onClick={resetCalibration}
-                  disabled={calibLines.length === 0}
+                  onClick={() => {
+                    setPlaneLines([]);
+                    cancelPending();
+                  }}
+                  disabled={planeLines.length === 0}
                 >
-                  Reset
+                  Clear
                 </button>
               </div>
-
-              <div className="status-grid">
-                <DirStatus
-                  label="Direction 1"
-                  color={DIR1_COLOR}
-                  lines={status.dir1Lines}
-                  hasLength={status.dir1HasLength}
-                />
-                <DirStatus
-                  label="Direction 2"
-                  color={DIR2_COLOR}
-                  lines={status.dir2Lines}
-                  hasLength={status.dir2HasLength}
-                />
+              <div className="progress-text">
+                {planeLines.length} line{planeLines.length === 1 ? "" : "s"} ·{" "}
+                <span
+                  style={{
+                    color:
+                      status.vanishingPoints >= 2
+                        ? "var(--good)"
+                        : "var(--muted)",
+                  }}
+                >
+                  {status.vanishingPoints} direction
+                  {status.vanishingPoints === 1 ? "" : "s"} detected
+                </span>
               </div>
-              <div className="hint" style={{ marginTop: 6 }}>
-                Need ≥{MIN_LINES_PER_DIRECTION} lines per direction and ≥1 known
-                length per direction.
-              </div>
-
-              {dirHint && (
+              {planeHint && (
                 <div className="hint" style={{ marginTop: 6 }}>
-                  {dirHint}
+                  {planeHint}
                 </div>
               )}
+            </div>
+          </div>
+        </div>
 
-              {(mode === "dir1" || mode === "dir2") &&
-                pending.length === 2 && (
-                  <div className="row" style={{ marginTop: 8 }}>
-                    <label className="field">
-                      Real length (mm) — optional
-                      <input
-                        type="number"
-                        autoFocus
-                        placeholder="e.g. 60"
-                        value={pendingLen}
-                        onChange={(e) => setPendingLen(e.target.value)}
-                        onKeyDown={(e) => e.key === "Enter" && confirmLine()}
-                      />
-                    </label>
-                    <button
-                      className="btn primary stretch-end"
-                      onClick={confirmLine}
-                    >
-                      Add
-                    </button>
-                    <button
-                      className="btn ghost stretch-end"
-                      onClick={cancelPending}
-                    >
-                      ✕
-                    </button>
-                  </div>
-                )}
-
-              {calibLines.length > 0 && (
+        {/* Step 3: set the scale */}
+        <div className="card">
+          <div
+            className={`step ${
+              calibrated ? "done" : scaleLines.length > 0 ? "active" : ""
+            }`}
+          >
+            <div className="num">3</div>
+            <div className="body">
+              <div className="title">Set the scale</div>
+              <div className="desc">
+                Trace segments whose <b>real length</b> you know. Use at least{" "}
+                <b>{MIN_SCALE_LINES}</b> lines in <b>varied directions</b> (for
+                rectangular objects, include a diagonal so the grid is fully
+                pinned).
+              </div>
+              <div className="row" style={{ marginTop: 10 }}>
+                <button
+                  className={`btn ${mode === "scale" ? "active" : ""}`}
+                  style={{ borderColor: SCALE_COLOR }}
+                  onClick={() => toggleMode("scale")}
+                  disabled={!hasImage}
+                >
+                  {mode === "scale" ? "Tracing…" : "+ Scale line"}
+                </button>
+                <button
+                  className="btn ghost"
+                  onClick={() => {
+                    setScaleLines([]);
+                    cancelPending();
+                  }}
+                  disabled={scaleLines.length === 0}
+                >
+                  Clear
+                </button>
+              </div>
+              <div className="progress-text">
+                {scaleLines.length}/{MIN_SCALE_LINES} known-length lines
+              </div>
+              {scaleHint && (
+                <div className="hint" style={{ marginTop: 6 }}>
+                  {scaleHint}
+                </div>
+              )}
+              {mode === "scale" && pending.length === 2 && (
+                <div className="row" style={{ marginTop: 8 }}>
+                  <label className="field">
+                    Real length (mm)
+                    <input
+                      type="number"
+                      autoFocus
+                      placeholder="e.g. 60"
+                      value={pendingLen}
+                      onChange={(e) => setPendingLen(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && confirmScaleLine()}
+                    />
+                  </label>
+                  <button
+                    className="btn primary stretch-end"
+                    onClick={confirmScaleLine}
+                  >
+                    Add
+                  </button>
+                  <button
+                    className="btn ghost stretch-end"
+                    onClick={cancelPending}
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+              {scaleLines.length > 0 && (
                 <div className="measure-list" style={{ marginTop: 10 }}>
-                  {calibLines.map((l) => (
+                  {scaleLines.map((l, i) => (
                     <div className="measure-item" key={l.id}>
-                      <span style={{ color: l.dir === 1 ? DIR1_COLOR : DIR2_COLOR }}>
-                        Dir {l.dir}
-                      </span>
-                      <span className="val" style={{ color: "var(--muted)" }}>
-                        {l.length ? `${l.length} mm` : "no length"}
+                      <span>Scale {i + 1}</span>
+                      <span className="val" style={{ color: SCALE_COLOR }}>
+                        {l.length} mm
                       </span>
                       <button
                         onClick={() =>
-                          setCalibLines((x) => x.filter((y) => y.id !== l.id))
+                          setScaleLines((x) => x.filter((y) => y.id !== l.id))
                         }
                         title="Delete"
                       >
@@ -670,7 +757,11 @@ export default function Home() {
                   ))}
                 </div>
               )}
-
+              {!calibrated && status.reason && planeLines.length > 0 && (
+                <div className="hint" style={{ marginTop: 8 }}>
+                  {status.reason}
+                </div>
+              )}
               {calib && (
                 <div style={{ marginTop: 10, display: "grid", gap: 4 }}>
                   <div className="metric">
@@ -685,10 +776,10 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Step 3: measure */}
+        {/* Step 4: measure */}
         <div className="card">
           <div className={`step ${calibrated ? "active" : ""}`}>
-            <div className="num">3</div>
+            <div className="num">4</div>
             <div className="body">
               <div className="title">Measure</div>
               <div className="desc">
@@ -710,7 +801,6 @@ export default function Home() {
                   Clear
                 </button>
               </div>
-
               {measurements.length > 0 && (
                 <div className="measure-list" style={{ marginTop: 10 }}>
                   {measurements.map((m, i) => (
@@ -740,8 +830,8 @@ export default function Home() {
 
         <div className="hint">
           <b>Controls:</b> click = place point · drag a point = move it · drag
-          the image = pan · wheel = zoom. Only measure objects on the same flat
-          plane as the calibration lines.
+          the image = pan · wheel = zoom · <kbd>Esc</kbd> = cancel the current
+          line. Only measure objects on the same flat plane as the calibration.
         </div>
       </aside>
 
@@ -777,43 +867,13 @@ export default function Home() {
   );
 }
 
-function DirStatus({
-  label,
-  color,
-  lines,
-  hasLength,
-}: {
-  label: string;
-  color: string;
-  lines: number;
-  hasLength: boolean;
-}) {
-  const ok = lines >= MIN_LINES_PER_DIRECTION && hasLength;
-  return (
-    <div className="dir-status">
-      <span className="dot" style={{ background: color }} />
-      <div>
-        <div className="dir-name">{label}</div>
-        <div className={`dir-meta ${ok ? "ok" : ""}`}>
-          {lines} line{lines === 1 ? "" : "s"} ·{" "}
-          {hasLength ? "length ✓" : "need length"}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 // ---- Canvas drawing helpers -----------------------------------------------
 
 function midpoint(a: Point, b: Point): Point {
   return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
 }
 
-function drawHandle(
-  ctx: CanvasRenderingContext2D,
-  p: Point,
-  color: string
-) {
+function drawHandle(ctx: CanvasRenderingContext2D, p: Point, color: string) {
   ctx.beginPath();
   ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
   ctx.fillStyle = color;
@@ -860,7 +920,8 @@ function drawExtendedLine(
   a: Point,
   b: Point,
   cw: number,
-  ch: number
+  ch: number,
+  style: string
 ) {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
@@ -872,7 +933,7 @@ function drawExtendedLine(
   ctx.save();
   ctx.setLineDash([6, 6]);
   ctx.lineWidth = 1;
-  ctx.strokeStyle = "rgba(255,255,255,0.5)";
+  ctx.strokeStyle = style;
   ctx.beginPath();
   ctx.moveTo(a.x - ux * far, a.y - uy * far);
   ctx.lineTo(a.x + ux * far, a.y + uy * far);

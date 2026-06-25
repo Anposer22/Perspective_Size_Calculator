@@ -3,26 +3,34 @@
 Aplicación web (sin backend) para **medir el tamaño real de objetos en una foto**
 a partir de un objeto de referencia de dimensiones conocidas.
 
-It recovers the camera perspective using **vanishing points**: the user traces
-edges along two perpendicular real-world directions on the flat surface. Those
-lines determine the plane's **horizon** (line at infinity), which fixes the
-projective distortion across the whole image. Because the two directions are
-perpendicular, the plane is upgraded to a **metric** rectification, and one
-known length per direction sets the scale. The result is accurate measurement
-**everywhere on the plane**, even with an oblique camera — not just where the
-calibration marks are.
+It uses **stratified metric rectification**, splitting calibration into two
+independent steps:
+
+- **Fix the plane (perspective).** Trace lines along straight edges of the
+  surface. Lines that are parallel in the real world meet at a vanishing point;
+  the app auto-detects these families (no labelling, and they need **not** be
+  perpendicular). Two or more vanishing points give the plane's **horizon**,
+  which removes the projective distortion across the whole image.
+- **Set the scale (size).** Trace segments of known real length. After the
+  horizon the plane is affine-rectified; a known length L of a segment with
+  affine displacement `d` satisfies `dᵀ S d = L²` for a symmetric metric matrix
+  `S`. Three+ lengths in varied directions determine `S` by least squares; its
+  Cholesky factor upgrades the plane to true metric.
+
+The result is accurate measurement **everywhere on the plane**, even with an
+oblique camera.
 
 ## Usage
 
 1. **Load an image**: paste with `Ctrl/Cmd+V` or upload a file.
-2. **Calibrate**:
-   - `+ Direction 1`: trace ≥2 edges that are parallel in the real world (e.g.
-     the long edges of your objects).
-   - `+ Direction 2`: trace ≥2 edges along the perpendicular direction.
-   - Give at least one **known real length per direction**.
-   - Make the lines **long and spread across the image** — short lines close
-     together produce poor vanishing points and large errors.
-3. **Measure**: trace segments anywhere on the same plane; the real length (mm)
+2. **Fix the plane** (`+ Plane line`): trace lines along straight edges of the
+   surface, giving at least **two different directions** (auto-detected; need
+   not be perpendicular). Longer, well-separated lines are best.
+3. **Set the scale** (`+ Scale line`): trace at least **3 known-length
+   segments in varied directions**. For rectangular objects, include a
+   **diagonal** so the metric is fully pinned (two perpendicular directions
+   alone leave it underdetermined).
+4. **Measure**: trace segments anywhere on the same plane; the real length (mm)
    appears live.
 
 ### Controls
@@ -31,6 +39,7 @@ calibration marks are.
 - **Drag a point**: move it (recalibrates/recomputes live).
 - **Drag the image**: pan. Middle button or `Space` also pan.
 - **Wheel**: zoom toward the cursor. A **magnifier loupe** aids sub-pixel aim.
+- **Esc**: cancel the line currently being drawn.
 
 ## Accuracy
 
