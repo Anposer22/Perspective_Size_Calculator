@@ -1,37 +1,39 @@
-# Calculadora de tamaños por perspectiva
+# Perspective Size Calculator
 
-Aplicación web (sin backend) para **medir el tamaño real de objetos en una foto**
-a partir de un objeto de referencia de dimensiones conocidas.
+A web app (no backend) to **measure the real size of objects in a photo** of a
+flat surface, using objects of known size as references. Runs entirely in the
+browser and deploys as a static Next.js app.
 
-It uses **stratified metric rectification**, splitting calibration into two
-independent steps:
+## How it works
 
-- **Fix the plane (perspective).** Trace lines along straight edges of the
-  surface. Lines that are parallel in the real world meet at a vanishing point;
-  the app auto-detects these families (no labelling, and they need **not** be
-  perpendicular). Two or more vanishing points give the plane's **horizon**,
-  which removes the projective distortion across the whole image.
-- **Set the scale (size).** Trace segments of known real length. After the
-  horizon the plane is affine-rectified; a known length L of a segment with
-  affine displacement `d` satisfies `dᵀ S d = L²` for a symmetric metric matrix
-  `S`. Three+ lengths in varied directions determine `S` by least squares; its
-  Cholesky factor upgrades the plane to true metric.
+You draw segments whose **real length** you know, distributed across the area
+you want to measure. The app fits the image→world (mm) homography by
+**regularized least squares**:
 
-The result is accurate measurement **everywhere on the plane**, even with an
-oblique camera.
+- It initializes with the best **affine** map (no perspective) from the known
+  lengths: a length `L` of an image segment with displacement `d` satisfies
+  `dᵀ S d = L²` for a symmetric 2×2 metric `S`.
+- It then refines the full 8-DOF homography (Levenberg–Marquardt) to match the
+  lengths, with a regularizer that pulls the perspective terms toward zero.
+
+That regularizer makes the model **adapt automatically**: a near top-down photo
+has no perspective to estimate, so the fit stays affine instead of overfitting
+noise into a fake perspective; an oblique photo recovers perspective when the
+data supports it. The header shows whether the result is `flat/affine` or
+`perspective`.
 
 ## Usage
 
 1. **Load an image**: paste with `Ctrl/Cmd+V` or upload a file.
-2. **Fix the plane** (`+ Plane line`): trace lines along straight edges of the
-   surface, giving at least **two different directions** (auto-detected; need
-   not be perpendicular). Longer, well-separated lines are best.
-3. **Set the scale** (`+ Scale line`): trace at least **3 known-length
-   segments in varied directions**. For rectangular objects, include a
-   **diagonal** so the metric is fully pinned (two perpendicular directions
-   alone leave it underdetermined).
-4. **Measure**: trace segments anywhere on the same plane; the real length (mm)
-   appears live.
+2. **Calibrate** (`+ Known length`): trace at least **5** segments of known
+   real length. Two rules matter for accuracy:
+   - **Varied directions** (not all parallel).
+   - **Spread across the whole area** you want to measure — references clustered
+     in one spot give poor results far away (a fundamental limit of single-photo
+     measurement, not a bug).
+3. **Measure**: trace segments anywhere on the same plane; the real length (mm)
+   appears live. A measure whose centre falls outside the area covered by your
+   references is marked `?` (lower confidence).
 
 ### Controls
 
@@ -43,19 +45,12 @@ oblique camera.
 
 ## Accuracy
 
-On synthetic oblique-camera tests with 2px clicking noise and calibration lines
-spread across the frame, full-image measurement error is **~0.3–1%** (median),
-including diagonals far from the calibration marks. Errors grow if the
-calibration lines for a direction are short and clustered together.
-
-## Limitations
-
-- Valid only for objects on the **same flat plane** as the calibration lines.
-  Height differences introduce parallax error.
-- Lens distortion (especially phone wide-angle near image edges) is not
-  corrected and adds a few percent.
-- The "fit error" (RMS) shows how well the model matches the known lengths; it
-  is a useful but partial reliability indicator.
+On synthetic tests with 2px clicking noise and references spread across the
+frame, full-image error is **~1%** at any camera angle (top-down to strongly
+oblique). It degrades to several percent if references are clustered together or
+far from what you measure, and is only valid for objects on the **same flat
+plane** as the references (height differences cause parallax error). Lens
+distortion near image edges is not corrected.
 
 ## Development
 
